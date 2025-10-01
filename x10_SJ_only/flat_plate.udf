@@ -3,6 +3,7 @@
 //
 #include <math.h>
 #include "udf.hpp"
+#include "plugins/tavg.hpp"
 #include <vector>
 #include <cmath>
 #include <fstream>
@@ -18,7 +19,7 @@ static std::vector<dfloat> usrwrk_host;
 static std::vector<dfloat> blas_prof;
 static int n_z, n_y, n_f;
 static int N_blasius = 10001;
-static int inletID = 2; // details in src/bdry/bcMap.hpp
+static int inletID = 1; // details in src/bdry/bcMap.hpp
 
 // Inflow profile arrays
 static std::vector<double> y_dist, z_dist;
@@ -188,10 +189,9 @@ void useric(nrs_t *nrs)
     double uy = U_inf * (eta_tmp * fp_tmp - f_tmp) / (2.0 * std::sqrt(Rex));
     double uz = 0.0;
 
-    nrs->U[i + 0 * nrs->fieldOffset] = ux;
-    nrs->U[i + 1 * nrs->fieldOffset] = uy;
-    nrs->U[i + 2 * nrs->fieldOffset] = uz;
-
+    // nrs->U[i + 0 * nrs->fieldOffset] = ux;
+    // nrs->U[i + 1 * nrs->fieldOffset] = uy;
+    // nrs->U[i + 2 * nrs->fieldOffset] = uz;
     // For blas profile
     blas_prof[i + 0 * nrs->fieldOffset] = ux;
     blas_prof[i + 1 * nrs->fieldOffset] = uy;
@@ -221,11 +221,13 @@ void UDF_Setup0(MPI_Comm comm, setupAide &options)
 void UDF_Setup(nrs_t *nrs)
 {
   mesh_t *mesh = nrs->meshV;
-  nrs->o_usrwrk = platform->device.malloc(nrs->NVfields * nrs->fieldOffset, sizeof(dfloat));
   blas_prof.resize(nrs->NVfields * nrs->fieldOffset, 0.0); // For blas profile
+  nrs->o_usrwrk = platform->device.malloc(nrs->NVfields * nrs->fieldOffset, sizeof(dfloat));
   useric(nrs);
-  nrs->o_U.copyFrom(nrs->U, nrs->NVfields * nrs->fieldOffset * sizeof(dfloat));
-  nrs->o_usrwrk.copyFrom(nrs->o_U, nrs->NVfields * nrs->fieldOffset * sizeof(dfloat));
+  if (platform->options.getArgs("RESTART FILE NAME").empty()){
+    nrs->o_U.copyFrom(blas_prof.data());
+  }
+  nrs->o_usrwrk.copyFrom(blas_prof.data());
 
   // Resize arrays based on n_y, n_z, n_f
   y_dist.resize(n_y);
@@ -243,35 +245,9 @@ void UDF_Setup(nrs_t *nrs)
   set_rpi_inflow();
   // Resize usrwrk_host to hold velocity BCs at inlet boundary nodes
   usrwrk_host.resize(nrs->NVfields * nrs->fieldOffset, 0.0);// For u, v, w
+  // Call for time averaging setup
+  tavg::setup(nrs);
 
-  // std::cout << "usrwrk_host size: " << usrwrk_host.size() << std::endl;
-  // std::cout << "nrs->NVfields: " << nrs->NVfields << ", nrs->fieldOffset: " << nrs->fieldOffset << std::endl;
-  // std::cout << "Nelements: " << nrs->meshV->Nelements << std::endl;
-  // std::cout << "Nlocal: " << nrs->meshV->Nlocal << std::endl;
-
-  // int rank = platform->comm.mpiRank;
-  // // Create filename unique to this rank
-  // std::string filename = "inlet_boundary_nodes_" + std::to_string(rank) + ".txt";
-  // std::ofstream outfile(filename);
-  // outfile << std::setprecision(8);
-
-  // for (int e = 0; e < nrs->meshV->Nelements; e++) {
-  //   for (int f = 0; f < nrs->meshV->Nfaces; f++) {
-  //     if (nrs->meshV->EToB[f + e * nrs->meshV->Nfaces] == inletID) {
-  //       for (int n = 0; n < nrs->meshV->Nfp; n++) {
-  //         const int idM = nrs->meshV->vmapM[e * nrs->meshV->Nfp * nrs->meshV->Nfaces + f * nrs->meshV->Nfp + n];
-          
-  //         if (idM >= 0 && idM < nrs->fieldOffset) {
-  //           outfile << idM << " " << mesh->x[idM] << " "
-  //           << mesh->y[idM] << " "
-  //           << mesh->z[idM] << "\n";
-  //         } else {
-  //           outfile << "idM out of bounds: " << idM <<  "\n";
-  //         }
-  //       }
-  //     }
-  //   }
-  // }
 }
 
 void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
@@ -340,6 +316,12 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
             v_bc = blas_prof[idM + 1 * nrs->fieldOffset] * (dt_rpi-time)/dt_rpi + v_bc * time/dt_rpi;
             w_bc = blas_prof[idM + 2 * nrs->fieldOffset] * (dt_rpi-time)/dt_rpi + w_bc * time/dt_rpi;
           }
+
+          if (y > y_dist.back() || z > z_dist.back() || z < z_dist.front()) {
+            u_bc = blas_prof[idM + 0 * nrs->fieldOffset];
+            v_bc = blas_prof[idM + 1 * nrs->fieldOffset];
+            w_bc = blas_prof[idM + 2 * nrs->fieldOffset];
+          }
           
           usrwrk_host[idM + 0 * nrs->fieldOffset] = u_bc;
           usrwrk_host[idM + 1 * nrs->fieldOffset] = v_bc;
@@ -349,13 +331,22 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
       } 
     }
   } 
-
   // Copy to device for next time step
   nrs->o_usrwrk.copyFrom(usrwrk_host.data());
-#if 0
+
+  if (time > 50.0)
+  {
+    tavg::run(time);
+  }
+  
   if (nrs->isOutputStep) {
     nek::ocopyToNek(time, tstep);
     nek::userchk();
+    postProcessing::Qcriterion(nrs, nrs->cds->o_S);
+    if (time > 50.0)
+    {
+      tavg::outfld(/* outXYZ */ 1, /* FP64 */ 1);
+    }
   }
-#endif
+
 }
