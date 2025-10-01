@@ -1,0 +1,4 @@
+*.usr linguist-language=Fortran
+*.udf linguist-language=C++
+*.oudf linguist-language=C++
+
