@@ -1,0 +1,205 @@
+//
+// nekRS User Defined File
+//
+#include <math.h>
+#include "udf.hpp"
+#include <vector>
+#include <cmath>
+#include <random>
+
+static dfloat U_inf;
+static dfloat AoA;
+static std::vector<dfloat> FU;
+static dfloat tdamp, rota;
+static dfloat sposx, sposy, sposz; 
+static dfloat eposx, eposy, eposz;
+static dfloat smthx, smthy;
+static dfloat Lz;
+static int nmode;
+static dfloat tdt;
+
+static std::vector<double> phase_current;  // For h_i(z), size nmode
+static std::vector<double> phase_next;     // For h_{i+1}(z), size nmode
+static occa::memory o_phase_curr;
+static occa::memory o_phase_next;
+
+static int last_harmonic_index = -1;
+static std::mt19937_64 rng(12345); // seed once (or seed per run)
+static std::uniform_real_distribution<double> U01(0.0, 1.0);; 
+
+
+#ifdef __okl__
+#include "NACA.oudf"
+#endif
+
+void UDF_LoadKernels(occa::properties &kernelInfo)
+{  
+  kernelInfo["defines/p_U_inf"] = U_inf;
+  kernelInfo["defines/p_AoA"] = AoA;
+  kernelInfo["defines/p_pi"] = M_PI;
+}
+
+void randomize_modes(std::vector<double>& phases) {
+  for (int n = 0; n < nmode; ++n) {
+    phases[n] = 2.0 * M_PI * U01(rng);
+  }
+}
+
+inline double eval_h_theta_phased(const double theta,
+  const std::vector<double>& phases){
+  double s = 0.0;
+  for (int n = 0; n < nmode; ++n) {
+    s += std::sin(n * theta + phases[n]);
+  }
+  return s;
+}
+
+/* UDF Functions */
+
+void generate_tripping_forces(nrs_t *nrs, dfloat time, occa::memory o_FU)
+{
+  auto* mesh = nrs->meshV;
+  const int    Np     = mesh->Nlocal;
+  const double Tu     = tdamp;
+  const double t_s    = tdt;
+  const double alpha  = rota;
+  const double x0     = sposx, y0 = sposy;
+  const double z0     = sposz, z1 = eposz;
+
+  // hoisted constants
+  const double ca = std::cos(alpha);
+  const double sa = std::sin(alpha);
+  const double invSmx = 1.0 / smthx;
+  const double invSmy = 1.0 / smthy;
+  const double invLz  = 1.0 / Lz;
+
+  // time blending
+  const int    i  = (int)std::floor(time / t_s);
+  const double p  = (time / t_s) - i;
+  const double bt = (3.0 - 2.0*p) * p * p; // 3p^2 - 2p^3
+
+  if (i != last_harmonic_index) {
+    // phase_current <- phase_next (device-to-device copy)
+    o_phase_curr.copyFrom(o_phase_next, nmode*sizeof(dfloat));
+    // phase_next <- new random (host -> device)
+    randomize_modes(phase_next);
+    o_phase_next.copyFrom(phase_next.data(), nmode*sizeof(dfloat));
+    last_harmonic_index = i;
+  }
+
+  // for (int node = 0; node < Np; ++node) {
+  //   const double z = mesh->z[node];
+  //   if (z < z0 || z > z1) continue;                     // cheap z-window gate
+
+  //   // rotate only nodes inside z-window
+  //   const double dx = mesh->x[node] - x0;
+  //   const double dy = mesh->y[node] - y0;
+  //   const double xr =  dx*ca + dy*sa;
+  //   const double yr = -dx*sa + dy*ca;
+
+  //   // ellipse gate (cheap)
+  //   const double rx = xr * invSmx;
+  //   const double ry = yr * invSmy;
+  //   const double r2 = rx*rx + ry*ry;
+  //   if (r2 > 1.0) continue;
+
+  //   // only now compute the expensive z-harmonic
+  //   const double theta = 2.0 * M_PI * z * invLz;
+  //   const double hiz   = eval_h_theta_phased(theta, phase_current);
+  //   const double hi1z  = eval_h_theta_phased(theta, phase_next);
+  //   const double fzt   = Tu * ((1.0 - bt)*hiz + bt*hi1z);
+
+  //   const double one_m_r2 = (1.0 - r2);
+  //   const double fsmth    = std::exp(-r2) * (one_m_r2 * one_m_r2);
+
+  //   FU[node + 0 * nrs->fieldOffset] = -(fsmth * fzt) * sa;
+  //   FU[node + 1 * nrs->fieldOffset] =  (fsmth * fzt) * ca;
+  //   FU[node + 2 * nrs->fieldOffset] =  0.0;
+  // }
+  fill_FU(mesh->Nlocal, nrs->fieldOffset,
+          mesh->o_x, mesh->o_y, mesh->o_z,
+          x0, y0, z0, z1,
+          invSmx, invSmy, invLz,
+          ca, sa,
+          o_phase_curr, o_phase_next,
+          nmode,Tu, bt, o_FU);
+          
+  if (nrs->isOutputStep)
+  {
+    const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+    auto o_FUy = nrs->o_FU.slice(1 * fieldOffsetByte, fieldOffsetByte);
+    auto o_S1 =  nrs->cds->o_S.slice(1 * fieldOffsetByte, fieldOffsetByte);
+    o_S1.copyFrom(o_FUy);
+  }
+  
+}
+
+void userf(nrs_t *nrs, dfloat time, occa::memory o_U, occa::memory o_FU)
+{
+  // auto mesh = nrs->meshV;
+  generate_tripping_forces(nrs, time, o_FU);
+  // o_FU.copyFrom(FU.data(), nrs->NVfields * nrs->fieldOffset * sizeof(dfloat));
+}
+
+void UDF_Setup0(MPI_Comm comm, setupAide &options)
+{
+  
+  platform->par->extract("casedata", "U_inf", U_inf);
+  platform->par->extract("casedata", "AoA", AoA);
+
+  platform->par->extract("casedata", "TDAMP", tdamp);
+  platform->par->extract("casedata", "SPOSX", sposx);
+  platform->par->extract("casedata", "SPOSY", sposy);
+  platform->par->extract("casedata", "SPOSZ", sposz);
+  platform->par->extract("casedata", "EPOSX", eposx);
+  platform->par->extract("casedata", "EPOSY", eposy);
+  platform->par->extract("casedata", "EPOSZ", eposz);
+  platform->par->extract("casedata", "SMTHX", smthx);
+  platform->par->extract("casedata", "SMTHY", smthy);
+  platform->par->extract("casedata", "ROTA", rota);
+  platform->par->extract("casedata", "NMODE", nmode);
+  platform->par->extract("casedata", "TDT", tdt);
+
+  *((double *)nek::scPtr(1)) = U_inf;
+  *((double *)nek::scPtr(2)) = AoA;
+}
+
+void UDF_Setup(nrs_t *nrs)
+{
+  mesh_t *mesh = nrs->meshV;
+  if (platform->options.getArgs("RESTART FILE NAME").empty()) {
+    for (int i = 0; i < mesh->Nlocal; ++i) {
+      nrs->U[i + 0 * nrs->fieldOffset] = U_inf*cos(AoA * M_PI/180.0);
+      nrs->U[i + 1 * nrs->fieldOffset] = U_inf*sin(AoA * M_PI/180.0);
+      nrs->U[i + 2 * nrs->fieldOffset] = 0.0;
+    }
+  }
+  Lz = std::abs(eposz - sposz);
+  phase_current.resize(nmode, 0.0);
+  phase_next.resize(nmode, 0.0);
+  randomize_modes(phase_current);
+  randomize_modes(phase_next);
+
+  o_phase_curr = platform->device.malloc(nmode, sizeof(dfloat));
+  o_phase_next = platform->device.malloc(nmode, sizeof(dfloat));
+  o_phase_curr.copyFrom(phase_current.data());
+  o_phase_next.copyFrom(phase_next.data());
+  
+  FU.resize(nrs->NVfields * nrs->fieldOffset, 0.0);// For u, v, w
+  std::fill(FU.begin(), FU.end(), 0.0);
+  udf.uEqnSource = &userf;
+
+}
+
+void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
+{
+  
+  if (nrs->isOutputStep) {
+    nek::ocopyToNek(time, tstep);
+    nek::userchk();
+    const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+    auto o_S0 =  nrs->cds->o_S.slice(0 * fieldOffsetByte, fieldOffsetByte);
+    postProcessing::Qcriterion(nrs, o_S0);
+  }
+
+}

@@ -1,0 +1,86 @@
+void velocityDirichletConditions(bcData *bc)
+{
+  bc->u = p_U_inf*cos(p_AoA * p_pi / 180.0);
+  bc->v = p_U_inf*sin(p_AoA * p_pi / 180.0);
+  bc->w = 0.0;
+}
+// Stabilized outflow (Dong et al)
+void pressureDirichletConditions(bcData *bc)
+{
+  bc->p = 0.0;
+}
+
+@kernel void fill_FU(const dlong Ntotal, const dlong offset,
+                      @ restrict const dfloat *X,
+                      @ restrict const dfloat *Y,
+                      @ restrict const dfloat *Z,
+                      const dfloat x0,
+                      const dfloat y0,
+                      const dfloat z0,
+                      const dfloat z1,
+                      const dfloat invSmx,
+                      const dfloat invSmy,
+                      const dfloat invLz,
+                      const dfloat ca,
+                      const dfloat sa,
+                      @ restrict const dfloat *phase_curr,
+                      @ restrict const dfloat *phase_next,
+                      const int nmode,
+                      const dfloat Tu,
+                      const dfloat bt,
+                      @ restrict dfloat *F){
+              
+  for (dlong node = 0; node < Ntotal; ++node; @tile(p_blockSize, @outer, @inner)) {
+
+    const dfloat z = Z[node];
+
+    // default output = 0
+    dfloat fx = 0.0;
+    dfloat fy = 0.0;
+    dfloat fz = 0.0;
+
+    // cheap z-window gate
+    if (z >= z0 && z <= z1) {
+      const dfloat dx = X[node] - x0;
+      const dfloat dy = Y[node] - y0;
+
+      // rotate
+      const dfloat xr =  dx*ca + dy*sa;
+      const dfloat yr = -dx*sa + dy*ca;
+
+      // ellipse gate
+      const dfloat rx = xr * invSmx;
+      const dfloat ry = yr * invSmy;
+      const dfloat r2 = rx*rx + ry*ry;
+
+      if (r2 <= 1.0) {
+        const dfloat theta = 2.0 * p_pi * z * invLz;
+
+        // harmonic sums along z
+        dfloat hiz  = 0.0;
+        dfloat hi1z = 0.0;
+
+        for (int n = 0; n < nmode; ++n;) {
+          hiz  += sin(n * theta + phase_curr[n]);
+          hi1z += sin(n * theta + phase_next[n]);
+        }
+
+        const dfloat fzt  = Tu * ((1.0 - bt) * hiz + bt * hi1z);
+        const dfloat omr2 = (1.0 - r2);
+        const dfloat fsmth = exp(-r2) * (omr2 * omr2);
+
+        const dfloat val = fsmth * fzt;
+
+        fx = -val * sa;
+        fy =  val * ca;
+        fz =  0.0;
+      }
+    }
+
+    F[node + 0 * offset] = fx;
+    F[node + 1 * offset] = fy;
+    F[node + 2 * offset] = fz;
+  }
+}
+
+  

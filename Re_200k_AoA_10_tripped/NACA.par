@@ -1,0 +1,68 @@
+#
+# nek parameter file
+#
+[OCCA]
+backend = CUDA
+deviceNumber = LOCAL-RANK
+
+[GENERAL]
+#verbose = true
+#startFrom = "NACA0.f00008+int"
+polynomialOrder = 7
+stopAt = endTime
+endTime = 20.0
+
+dt = targetCFL=3 + max=5e-3 + initial=1e-5
+timeStepper = tombo2
+
+writeControl = simulationTime 
+writeInterval = 0.25
+
+regularization = hpfrt + nModes=1 + scalingCoeff=5
+
+[MESH]
+writeToFieldFile = true
+connectivityTol = 1.0
+
+[PRESSURE]
+residualTol = 1e-04
+# coarseGridDiscretization = SEMFEM
+# semfemSolver = boomerAMG+device
+# smootherType = RAS+FourthOptChebyshev
+
+[VELOCITY]
+boundaryTypeMap = codedFixedValue,fixedGradient,zeroValue,fixedGradient,codedFixedValue,none,none
+viscosity = 1/200000
+density = 1.0
+residualTol = 1e-06
+
+[SCALAR00] #Qcriterion
+solver = none
+
+[SCALAR01] #Tripping forcing
+solver = none
+
+# [BOOMERAMG]
+# coarsenType                 = HMIS              # PMIS also OK
+# interpolationType           = Ext+i             # or modified classical if Ext+i unavailable
+# iterations                  = 1                 # V(1,1); bump to 2 only if needed
+# strongThreshold             = 0.6               # 0.5–0.7 sweet spot
+# aggressiveCoarseningLevels  = 1
+# chebyshevRelaxOrder         = 2
+# nonGalerkinTol              = 0                 # try 0.01 later if SpMV dominates and convergence is robust
+
+[CASEDATA]
+U_inf = 1.0    # Freestream velocity.
+AoA = 10.0     # Angle of attack in degrees.
+TDAMP = 20.0         # Time dependent amplitude
+SPOSX = 0.1        # Starting pont X
+SPOSY = 0.0660         # Starting pont Y
+SPOSZ = 0.0        # Starting pont Z
+EPOSX = 0.1         # Ending pont X
+EPOSY = 0.0660       # Ending pont Y
+EPOSZ = 0.1        # Ending pont Z
+SMTHX = 0.005        # Smoothing length X
+SMTHY = 0.002        # Smoothing length Y
+ROTA  = 0.31416        # Rotation angle in radians
+NMODE = 64		              # Number of Fourier modes
+TDT = 0.005	      # Time step for tripping
