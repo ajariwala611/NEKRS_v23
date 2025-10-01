@@ -1,0 +1,361 @@
+//
+// nekRS User Defined File
+//
+#include <math.h>
+#include "udf.hpp"
+#include <vector>
+#include <cmath>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+
+static dfloat xstart;
+static dfloat U_inf;
+static dfloat BETAM;
+static dfloat dt_rpi; 
+static std::vector<double> eta, f, fp;
+static std::vector<dfloat> usrwrk_host;
+static std::vector<dfloat> blas_prof;
+static int n_z, n_y, n_f;
+static int N_blasius = 10001;
+static int inletID = 2; // details in src/bdry/bcMap.hpp
+
+// Inflow profile arrays
+static std::vector<double> y_dist, z_dist;
+static std::vector<std::vector<std::vector<double>>> inflow_prof_u;
+static std::vector<std::vector<std::vector<double>>> inflow_prof_v;
+static std::vector<std::vector<std::vector<double>>> inflow_prof_w;
+
+// Allocate temporary 2D arrays for interpolated profiles
+// Temporary 2D arrays for time-interpolated profiles (allocated in UDF_ExecuteStep)
+static std::vector<std::vector<double>> prof_u; // [n_z][n_y]
+static std::vector<std::vector<double>> prof_v; // [n_z][n_y]
+static std::vector<std::vector<double>> prof_w; // [n_z][n_y]
+
+#ifdef __okl__
+#include "flat_plate.oudf"
+#endif
+
+void UDF_LoadKernels(occa::properties &kernelInfo)
+{
+  
+  kernelInfo["defines/p_xstart"] = xstart;
+  kernelInfo["defines/p_U_inf"] = U_inf;
+
+  dfloat viscosity,density;
+  platform->options.getArgs("VISCOSITY", viscosity);
+  kernelInfo["defines/p_visc"] = viscosity;
+  platform->options.getArgs("DENSITY", density);
+  kernelInfo["defines/p_rho"] = density;
+  kernelInfo["defines/p_nu"] = viscosity/density;
+}
+
+
+void read_1d_grid(const std::string& filename, std::vector<double>& grid) {
+  std::ifstream file(filename);
+  if (!file) throw std::runtime_error("Cannot open " + filename);
+  for (double& val : grid) file >> val;
+}
+
+void read_3d_profile(const std::string& filename, std::vector<std::vector<std::vector<double>>>& prof) {
+  std::ifstream file(filename);
+  if (!file) throw std::runtime_error("Cannot open " + filename);
+  for (int f = 0; f < n_f; ++f) {
+      for (int z = 0; z < n_z; ++z) {
+          for (int y = 0; y < n_y; ++y) {
+              file >> prof[z][y][f];
+          }
+      }
+  }
+}
+
+void set_rpi_inflow()
+{
+    // Read grids
+    read_1d_grid("rpi_grid_y.dat", y_dist);
+    read_1d_grid("rpi_grid_z.dat", z_dist);
+
+    // Read profiles
+    read_3d_profile("inflow_prof_U.dat", inflow_prof_u);
+    read_3d_profile("inflow_prof_V.dat", inflow_prof_v);
+    read_3d_profile("inflow_prof_W.dat", inflow_prof_w);
+
+    // Now inflow_prof_u[z][y][f] holds the U velocity at (z,y) for frame f
+    // Similarly for V and W
+}
+
+// 2D bilinear interpolation for uniform grid data
+// xd: x grid (size nx), yd: y grid (size ny), zd: data (size nx x ny)
+// xq, yq: query coordinates
+// Returns interpolated value
+double interp_2d_rpi_data(
+  int nx, int ny,
+  const std::vector<double>& xd,
+  const std::vector<double>& yd,
+  const std::vector<std::vector<double>>& zd,
+  double xq, double yq)
+{
+  // Extrapolation below first y grid
+  for (int i = 0; i < nx - 1; ++i) {
+      if (xq >= xd[i] && xq <= xd[i + 1]) {
+          if (yq < yd[0]) {
+              double q12 = zd[i][0];
+              double q22 = zd[i + 1][0];
+              double f2 = ((xd[i + 1] - xq) * q12 + (xq - xd[i]) * q22) / (xd[i + 1] - xd[i]);
+              return (yq * f2) / yd[0];
+          } else {
+              for (int j = 0; j < ny - 1; ++j) {
+                  if (yq >= yd[j] && yq <= yd[j + 1]) {
+                      double q11 = zd[i][j];
+                      double q21 = zd[i + 1][j];
+                      double q12 = zd[i][j + 1];
+                      double q22 = zd[i + 1][j + 1];
+
+                      double f1 = ((xd[i + 1] - xq) * q11 + (xq - xd[i]) * q21) / (xd[i + 1] - xd[i]);
+                      double f2 = ((xd[i + 1] - xq) * q12 + (xq - xd[i]) * q22) / (xd[i + 1] - xd[i]);
+                      return ((yd[j + 1] - yq) * f1 + (yq - yd[j]) * f2) / (yd[j + 1] - yd[j]);
+                  }
+              }
+          }
+      }
+  }
+  // If out of bounds, you can return 0 or clamp to edge value
+  return 0.0;
+}
+// Numerically solve Blasius ODE (simple shooting method)
+void solve_blasius(std::vector<double>& eta, std::vector<double>& f, std::vector<double>& fp, int N, double eta_max)
+{
+  double deta = eta_max / (N - 1);
+  eta.resize(N);
+  f.resize(N);
+  fp.resize(N);
+
+  // Initial conditions
+  double f_tmp = 0.0;
+  double fp_tmp = 0.0;
+  double fpp_tmp = 0.332; // f''(0) ≈ 0.332
+  double fppp_tmp = 0.0;
+
+  for (int i = 0; i < N; ++i) {
+    eta[i] = i * deta;
+    f[i] = f_tmp;
+    fp[i] = fp_tmp;
+    fppp_tmp = -0.5 * f_tmp * fpp_tmp;
+    fpp_tmp += deta * fppp_tmp;
+    fp_tmp += deta * fpp_tmp;
+    f_tmp += deta * fp_tmp;
+  }
+}
+
+// Linear interpolation for arrays
+double interp1d(const std::vector<double>& x, const std::vector<double>& y, double xval)
+{
+  if (xval <= x.front()) return y.front();
+  if (xval >= x.back()) return y.back();
+  for (size_t i = 1; i < x.size(); ++i) {
+    if (xval < x[i]) {
+      double t = (xval - x[i-1]) / (x[i] - x[i-1]);
+      return y[i-1] + t * (y[i] - y[i-1]);
+    }
+  }
+  return y.back();
+}
+
+void useric(nrs_t *nrs)
+{
+  auto mesh = nrs->meshV;
+
+  dfloat mue, rho;
+  platform->options.getArgs("VISCOSITY", mue);
+  platform->options.getArgs("DENSITY", rho);
+  const dfloat nu = mue / rho;
+
+  // Precompute Blasius solution
+  
+  const double eta_max = 10.0;
+  solve_blasius(eta, f, fp, N_blasius, eta_max);
+
+  for (int i = 0; i < mesh->Nlocal; ++i) {
+    double x = mesh->x[i] + xstart;
+    double y = mesh->y[i];
+    double Rex = U_inf * x / nu;
+
+    double eta_tmp = (y / x) * std::sqrt(Rex);
+    double f_tmp = interp1d(eta, f, eta_tmp);
+    double fp_tmp = interp1d(eta, fp, eta_tmp);
+
+    double ux = U_inf * fp_tmp;
+    double uy = U_inf * (eta_tmp * fp_tmp - f_tmp) / (2.0 * std::sqrt(Rex));
+    double uz = 0.0;
+
+    nrs->U[i + 0 * nrs->fieldOffset] = ux;
+    nrs->U[i + 1 * nrs->fieldOffset] = uy;
+    nrs->U[i + 2 * nrs->fieldOffset] = uz;
+
+    // For blas profile
+    blas_prof[i + 0 * nrs->fieldOffset] = ux;
+    blas_prof[i + 1 * nrs->fieldOffset] = uy;
+    blas_prof[i + 2 * nrs->fieldOffset] = uz;
+  }
+}
+
+/* UDF Functions */
+
+void UDF_Setup0(MPI_Comm comm, setupAide &options)
+{
+  platform->par->extract("casedata", "xstart", xstart);
+  platform->par->extract("casedata", "U_inf", U_inf);
+  platform->par->extract("casedata", "BETAM", BETAM);
+  platform->par->extract("casedata", "dt_rpi", dt_rpi);
+  platform->par->extract("casedata", "n_z", n_z);
+  platform->par->extract("casedata", "n_y", n_y);
+  platform->par->extract("casedata", "n_f", n_f);
+
+  *((double *)nek::scPtr(1)) = xstart;
+  *((double *)nek::scPtr(2)) = U_inf;
+  *((double *)nek::scPtr(3)) = BETAM;
+  *((double *)nek::scPtr(4)) = dt_rpi;
+  
+}
+
+void UDF_Setup(nrs_t *nrs)
+{
+  mesh_t *mesh = nrs->meshV;
+  nrs->o_usrwrk = platform->device.malloc(nrs->NVfields * nrs->fieldOffset, sizeof(dfloat));
+  blas_prof.resize(nrs->NVfields * nrs->fieldOffset, 0.0); // For blas profile
+  useric(nrs);
+  nrs->o_U.copyFrom(nrs->U, nrs->NVfields * nrs->fieldOffset * sizeof(dfloat));
+  nrs->o_usrwrk.copyFrom(nrs->o_U, nrs->NVfields * nrs->fieldOffset * sizeof(dfloat));
+
+  // Resize arrays based on n_y, n_z, n_f
+  y_dist.resize(n_y);
+  z_dist.resize(n_z);
+
+  inflow_prof_u.resize(n_z, std::vector<std::vector<double>>(n_y, std::vector<double>(n_f)));
+  inflow_prof_v.resize(n_z, std::vector<std::vector<double>>(n_y, std::vector<double>(n_f)));
+  inflow_prof_w.resize(n_z, std::vector<std::vector<double>>(n_y, std::vector<double>(n_f)));
+
+  prof_u.resize(n_z, std::vector<double>(n_y));
+  prof_v.resize(n_z, std::vector<double>(n_y));
+  prof_w.resize(n_z, std::vector<double>(n_y));
+
+  // Read RPI inflow data
+  set_rpi_inflow();
+  // Resize usrwrk_host to hold velocity BCs at inlet boundary nodes
+  usrwrk_host.resize(nrs->NVfields * nrs->fieldOffset, 0.0);// For u, v, w
+
+  // std::cout << "usrwrk_host size: " << usrwrk_host.size() << std::endl;
+  // std::cout << "nrs->NVfields: " << nrs->NVfields << ", nrs->fieldOffset: " << nrs->fieldOffset << std::endl;
+  // std::cout << "Nelements: " << nrs->meshV->Nelements << std::endl;
+  // std::cout << "Nlocal: " << nrs->meshV->Nlocal << std::endl;
+
+  // int rank = platform->comm.mpiRank;
+  // // Create filename unique to this rank
+  // std::string filename = "inlet_boundary_nodes_" + std::to_string(rank) + ".txt";
+  // std::ofstream outfile(filename);
+  // outfile << std::setprecision(8);
+
+  // for (int e = 0; e < nrs->meshV->Nelements; e++) {
+  //   for (int f = 0; f < nrs->meshV->Nfaces; f++) {
+  //     if (nrs->meshV->EToB[f + e * nrs->meshV->Nfaces] == inletID) {
+  //       for (int n = 0; n < nrs->meshV->Nfp; n++) {
+  //         const int idM = nrs->meshV->vmapM[e * nrs->meshV->Nfp * nrs->meshV->Nfaces + f * nrs->meshV->Nfp + n];
+          
+  //         if (idM >= 0 && idM < nrs->fieldOffset) {
+  //           outfile << idM << " " << mesh->x[idM] << " "
+  //           << mesh->y[idM] << " "
+  //           << mesh->z[idM] << "\n";
+  //         } else {
+  //           outfile << "idM out of bounds: " << idM <<  "\n";
+  //         }
+  //       }
+  //     }
+  //   }
+  // }
+}
+
+void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
+{
+  
+  // Find frame indices and cycle
+  int counter = static_cast<int>(std::floor(time / dt_rpi));
+  int fnum = counter % n_f; // frame index (0-based)
+  int cycle = static_cast<int>(std::floor(time / dt_rpi / n_f)); // cycle number
+  
+  double t0 = counter * dt_rpi;
+  double t1 = (counter + 1) * dt_rpi;
+  double w0 = (t1 - time) / dt_rpi;
+  double w1 = (time - t0) / dt_rpi;
+  
+  int last = n_f - 1;
+  int fnump1 = (fnum + 1) % n_f;
+  
+  if (cycle == 0 && fnum == 0) {
+    // Use only the first frame (no interpolation)
+    for (int z = 0; z < n_z; ++z) {
+      for (int y = 0; y < n_y; ++y) {
+          prof_u[z][y] = inflow_prof_u[z][y][0];
+          prof_v[z][y] = inflow_prof_v[z][y][0];
+          prof_w[z][y] = inflow_prof_w[z][y][0];
+      }
+    }
+  }
+  else if (cycle > 0 && fnum == 0) {
+    // Interpolate between last and first frame
+    for (int z = 0; z < n_z; ++z) {
+      for (int y = 0; y < n_y; ++y) {
+          prof_u[z][y] = inflow_prof_u[z][y][last] * w0 + inflow_prof_u[z][y][0] * w1;
+          prof_v[z][y] = inflow_prof_v[z][y][last] * w0 + inflow_prof_v[z][y][0] * w1;
+          prof_w[z][y] = inflow_prof_w[z][y][last] * w0 + inflow_prof_w[z][y][0] * w1;
+      }
+    }
+  }
+  else {
+    // Regular interpolation between fnum and fnump1
+    for (int z = 0; z < n_z; ++z) {
+      for (int y = 0; y < n_y; ++y) {
+          prof_u[z][y] = inflow_prof_u[z][y][fnum] * w0 + inflow_prof_u[z][y][fnump1] * w1;
+          prof_v[z][y] = inflow_prof_v[z][y][fnum] * w0 + inflow_prof_v[z][y][fnump1] * w1;
+          prof_w[z][y] = inflow_prof_w[z][y][fnum] * w0 + inflow_prof_w[z][y][fnump1] * w1;
+      }
+    }
+  }
+
+  // Interpolate in space and fill usrwrk_host for inlet boundary nodes
+  for (int e = 0; e < nrs->meshV->Nelements; e++) {
+    for (int f = 0; f < nrs->meshV->Nfaces; f++) {
+      if (nrs->meshV->EToB[f + e * nrs->meshV->Nfaces] == inletID) {
+        for (int n = 0; n < nrs->meshV->Nfp; n++) {
+          const int idM = nrs->meshV->vmapM[e * nrs->meshV->Nfp * nrs->meshV->Nfaces + f * nrs->meshV->Nfp + n];
+          double x = nrs->meshV->x[idM];
+          double y = nrs->meshV->y[idM];
+          double z = nrs->meshV->z[idM];
+
+          double u_bc = interp_2d_rpi_data(n_z, n_y, z_dist, y_dist, prof_u, z, y);
+          double v_bc = interp_2d_rpi_data(n_z, n_y, z_dist, y_dist, prof_v, z, y);
+          double w_bc = interp_2d_rpi_data(n_z, n_y, z_dist, y_dist, prof_w, z, y);
+
+          if (cycle == 0 && fnum == 0){
+            u_bc = blas_prof[idM + 0 * nrs->fieldOffset] * (dt_rpi-time)/dt_rpi + u_bc * time/dt_rpi;
+            v_bc = blas_prof[idM + 1 * nrs->fieldOffset] * (dt_rpi-time)/dt_rpi + v_bc * time/dt_rpi;
+            w_bc = blas_prof[idM + 2 * nrs->fieldOffset] * (dt_rpi-time)/dt_rpi + w_bc * time/dt_rpi;
+          }
+          
+          usrwrk_host[idM + 0 * nrs->fieldOffset] = u_bc;
+          usrwrk_host[idM + 1 * nrs->fieldOffset] = v_bc;
+          usrwrk_host[idM + 2 * nrs->fieldOffset] = w_bc;
+
+        }
+      } 
+    }
+  } 
+
+  // Copy to device for next time step
+  nrs->o_usrwrk.copyFrom(usrwrk_host.data());
+#if 0
+  if (nrs->isOutputStep) {
+    nek::ocopyToNek(time, tstep);
+    nek::userchk();
+  }
+#endif
+}
