@@ -55,9 +55,9 @@ Force compute_dragv(nrs_t *nrs, int nbID, const occa::memory& o_bID, occa::memor
     dragvx = (dfloat *) calloc(mesh->Nelements, sizeof(dfloat));
     dragvy = (dfloat *) calloc(mesh->Nelements, sizeof(dfloat));
     dragvz = (dfloat *) calloc(mesh->Nelements, sizeof(dfloat));
-    o_dragvx = platform->device.malloc<dfloat>(mesh->Nelements);
-    o_dragvy = platform->device.malloc<dfloat>(mesh->Nelements);
-    o_dragvz = platform->device.malloc<dfloat>(mesh->Nelements);
+    o_dragvx = platform->device.malloc(mesh->Nelements,sizeof(dfloat));
+    o_dragvy = platform->device.malloc(mesh->Nelements,sizeof(dfloat));
+    o_dragvz = platform->device.malloc(mesh->Nelements,sizeof(dfloat));
   }
 
   dragvKernel(mesh->Nelements,
@@ -104,9 +104,9 @@ Force compute_dragp(nrs_t *nrs, int nbID, const occa::memory& o_bID, occa::memor
     dragpx = (dfloat *) calloc(mesh->Nelements, sizeof(dfloat));
     dragpy = (dfloat *) calloc(mesh->Nelements, sizeof(dfloat));
     dragpz = (dfloat *) calloc(mesh->Nelements, sizeof(dfloat));
-    o_dragpx = platform->device.malloc<dfloat>(mesh->Nelements);
-    o_dragpy = platform->device.malloc<dfloat>(mesh->Nelements);
-    o_dragpz = platform->device.malloc<dfloat>(mesh->Nelements);
+    o_dragpx = platform->device.malloc(mesh->Nelements,sizeof(dfloat));
+    o_dragpy = platform->device.malloc(mesh->Nelements,sizeof(dfloat));
+    o_dragpz = platform->device.malloc(mesh->Nelements,sizeof(dfloat));
   }                   
                       
   dragpKernel(mesh->Nelements,
@@ -277,11 +277,11 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
 {
   // compute drag
   std::vector<int> bidWall = {3};
-  occa::memory o_bidWall = platform->device.malloc<int>(bidWall.size(), bidWall.data());
+  occa::memory o_bidWall = platform->device.malloc(bidWall.size(), bidWall.data());
 
-  const dfloat scale = 2.0 * Lz; // CD = F/(.5 rho U^2 * A) = 2*F, A=c*Lz, rho=1, U=U_inf
-  auto o_Sij = platform->o_memPool.reserve<dfloat>(2 * nrs->NVfields * nrs->fieldOffset);
-  postProcessing::strainRate(nrs, false, nrs->o_U, o_Sij); // "false" is correct
+  const dfloat scale = 1.0; // CD = F/(.5 rho U^2 * A) = 2*F, A=c*Lz, rho=1, U=U_inf
+  auto o_Sij = platform->device.malloc(2 * nrs->NVfields * nrs->fieldOffset, sizeof(dfloat));
+  postProcessing::strainRate(nrs, false, o_Sij); // "false" is correct
   
   Force dragv = compute_dragv(nrs, bidWall.size(), o_bidWall, o_Sij, scale);
   Force dragp = compute_dragp(nrs, bidWall.size(), o_bidWall, nrs->o_P, scale);
