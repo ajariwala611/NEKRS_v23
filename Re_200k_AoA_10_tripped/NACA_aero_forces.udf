@@ -14,7 +14,7 @@
 
 static dfloat U_inf;
 static dfloat AoA;
-static std::vector<dfloat> FU;
+static dfloat AoA_rad;
 static dfloat tdamp, rota;
 static dfloat sposx, sposy, sposz; 
 static dfloat eposx, eposy, eposz;
@@ -257,18 +257,17 @@ void UDF_Setup(nrs_t *nrs)
     }
   }
   Lz = std::abs(eposz - sposz);
+  AoA_rad = AoA * M_PI / 180.0;
   phase_current.resize(nmode, 0.0);
   phase_next.resize(nmode, 0.0);
   randomize_modes(phase_current);
   randomize_modes(phase_next);
-
+  
   o_phase_curr = platform->device.malloc(nmode, sizeof(dfloat));
   o_phase_next = platform->device.malloc(nmode, sizeof(dfloat));
   o_phase_curr.copyFrom(phase_current.data());
   o_phase_next.copyFrom(phase_next.data());
   
-  FU.resize(nrs->NVfields * nrs->fieldOffset, 0.0);// For u, v, w
-  std::fill(FU.begin(), FU.end(), 0.0);
   udf.uEqnSource = &userf;
 
 }
@@ -281,7 +280,7 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
 
   const dfloat scale = 1.0; // CD = F/(.5 rho U^2 * A) = 2*F, A=c*Lz, rho=1, U=U_inf
   auto o_Sij = platform->device.malloc(2 * nrs->NVfields * nrs->fieldOffset, sizeof(dfloat));
-  postProcessing::strainRate(nrs, false, o_Sij); // "false" is correct
+  postProcessing::strainRate(nrs, true, o_Sij); // "false" is correct
   
   Force dragv = compute_dragv(nrs, bidWall.size(), o_bidWall, o_Sij, scale);
   Force dragp = compute_dragp(nrs, bidWall.size(), o_bidWall, nrs->o_P, scale);
@@ -292,15 +291,22 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
   drag.y = dragp.y + dragv.y;
   drag.z = dragp.z + dragv.z;
 
-  if (platform->comm.mpiRank == 0) { // match with nek5000's torque_calc after first step.
-    printf("%d %.8e %.8e %.8e %.8e dragx(rs)\n",tstep,time,drag.x,dragp.x,dragv.x);
-    printf("%d %.8e %.8e %.8e %.8e dragy(rs)\n",tstep,time,drag.y,dragp.y,dragv.y);
-    printf("%d %.8e %.8e %.8e %.8e dragz(rs)\n",tstep,time,drag.z,dragp.z,dragv.z);
+  double F_drag =  drag.x * cos(AoA_rad) + drag.y * sin(AoA_rad);
+  double F_lift = -drag.x * sin(AoA_rad) + drag.y * cos(AoA_rad);
+
+  double Cd = F_drag / (0.5 * Lz);
+  double Cl = F_lift / (0.5 * Lz);
+
+  if (platform->comm.mpiRank == 0) {
+    printf("%d %15.8e %15.8e %15.8e %15.8e dragx(rs)\n",tstep,time,drag.x,dragp.x,dragv.x);
+    printf("%d %15.8e %15.8e %15.8e %15.8e dragy(rs)\n",tstep,time,drag.y,dragp.y,dragv.y);
+    printf("%d %15.8e %15.8e %15.8e %15.8e dragz(rs)\n",tstep,time,drag.z,dragp.z,dragv.z);
+    printf("%d %15.8e %15.8e %15.8e %15.8e %15.8e \n", tstep, time, F_drag, F_lift, Cd, Cl);
   }
 
   if (nrs->isOutputStep) {
-    nek::ocopyToNek(time, tstep);
-    nek::userchk();
+    // nek::ocopyToNek(time, tstep);
+    // nek::userchk();
     const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
     auto o_S0 =  nrs->cds->o_S.slice(0 * fieldOffsetByte, fieldOffsetByte);
     postProcessing::Qcriterion(nrs, o_S0);
