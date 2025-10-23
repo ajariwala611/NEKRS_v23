@@ -5,13 +5,13 @@
 #include "udf.hpp"
 #include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <math.h>
 #include <random>
 #include <sstream>
 #include <string>
 #include <vector>
-#include <iomanip>
 
 #ifdef __okl__
 #include "NACA.oudf"
@@ -51,7 +51,8 @@ struct Force {
 };
 
 static occa::memory o_ObsUp, o_ObsUprime, o_CtrlUp;
-static pointInterpolation_t *obsInterpolator = nullptr, *ctrlInterpolator = nullptr;
+static pointInterpolation_t *obsInterpolator = nullptr,
+                            *ctrlInterpolator = nullptr;
 static int obs_np = 0, ctrl_np = 0;
 
 /* Viscous Drag and Pressure Drag */
@@ -259,7 +260,7 @@ void setupInterpolators(nrs_t *nrs, pointInterpolation_t *&obsInterpolator,
                  platform->comm.mpiRank);
     obs_np = obs_x.size();
     o_ObsUp = platform->device.malloc(nrs->NVfields * obs_np, sizeof(dfloat));
-    o_ObsUprime = platform->device.malloc(obs_np * sizeof(dfloat)); 
+    o_ObsUprime = platform->device.malloc(obs_np, sizeof(dfloat));
     obsInterpolator = new pointInterpolation_t(nrs);
     obsInterpolator->setPoints(obs_np, obs_x.data(), obs_y.data(),
                                obs_z.data());
@@ -269,8 +270,7 @@ void setupInterpolators(nrs_t *nrs, pointInterpolation_t *&obsInterpolator,
     readGridFile("control_grid.txt", ctrl_x, ctrl_y, ctrl_z,
                  platform->comm.mpiRank);
     ctrl_np = ctrl_x.size();
-    o_CtrlUp =
-        platform->device.malloc(nrs->NVfields * ctrl_np, sizeof(dfloat));
+    o_CtrlUp = platform->device.malloc(ctrl_np, sizeof(dfloat));
     ctrlInterpolator = new pointInterpolation_t(nrs);
     ctrlInterpolator->setPoints(ctrl_np, ctrl_x.data(), ctrl_y.data(),
                                 ctrl_z.data());
@@ -281,17 +281,20 @@ void setupInterpolators(nrs_t *nrs, pointInterpolation_t *&obsInterpolator,
 void interpolateObsGrid(nrs_t *nrs, dfloat time, int tstep) {
 
   // Interpolate velocity
+  const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
   occa::memory o_Uavg = tavg::get_o_Uavg();
+  occa::memory o_mean_ux = o_Uavg.slice(0 * fieldOffsetByte, fieldOffsetByte);
   obsInterpolator->eval(nrs->NVfields, nrs->fieldOffset, o_Uavg, obs_np,
                         o_ObsUp);
-  
 
   // Interpolate velocity fluctuation (if available)
-  occa::memory ux_prime = platform->device.malloc(nrs->fieldOffset, sizeof(dfloat));;
-  platform->linAlg->axpbyz(nrs->meshV->Nlocal, 1.0, nrs->o_U, -1.0, o_Uavg,
+  occa::memory ux_prime =
+      platform->device.malloc(nrs->fieldOffset, sizeof(dfloat));
+  occa::memory o_ux = nrs->o_U.slice(0 * fieldOffsetByte, fieldOffsetByte);
+  platform->linAlg->axpbyz(nrs->meshV->Nlocal, 1.0, o_ux, -1.0, o_mean_ux,
                            ux_prime);
   obsInterpolator->eval(1, nrs->fieldOffset, ux_prime, obs_np, o_ObsUprime);
-  
+
   if (platform->comm.mpiRank == 0) {
     std::vector<dfloat> ObsUp(nrs->NVfields * obs_np);
     o_ObsUp.copyTo(ObsUp.data());
@@ -299,24 +302,63 @@ void interpolateObsGrid(nrs_t *nrs, dfloat time, int tstep) {
     std::vector<dfloat> ObsUprime(obs_np);
     o_ObsUprime.copyTo(ObsUprime.data());
 
-    std::ofstream fout("LSM.txt", std::ios::trunc); // 'replace' mode
+    std::ofstream fout("observation_grid_data.txt",
+                       std::ios::trunc); // 'replace' mode
 
-    printf("Writing new LSM data into LSM.txt ... ");
-    fout << "#time = " << std::setprecision(7) << std::scientific << time << std::endl;
+    printf("Writing new LSM data into observation_grid_data.txt ... ");
+    fout << "#time = " << std::setprecision(7) << std::scientific << time
+         << std::endl;
     fout << "#  <u>  <v>  u_prime" << std::endl;
 
     for (int i = 0; i < obs_np; ++i) {
-        fout << std::setw(15) << std::setprecision(8) << std::scientific << ObsUp[i + 0 * obs_np] << " "
-             << std::setw(15) << std::setprecision(8) << std::scientific << ObsUp[i + 1 * obs_np] << " "
-             << std::setw(15) << std::setprecision(8) << std::scientific << ObsUprime[i]
-             << std::endl;
+      fout << std::setw(15) << std::setprecision(8) << std::scientific
+           << ObsUp[i + 0 * obs_np] << " " << std::setw(15)
+           << std::setprecision(8) << std::scientific << ObsUp[i + 1 * obs_np]
+           << " " << std::setw(15) << std::setprecision(8) << std::scientific
+           << ObsUprime[i] << std::endl;
     }
     fout.close();
     printf("Done \n");
   }
 }
 
-// void interpolateCtrlGrid(nrs_t *nrs, dfloat time, int tstep) {}
+void interpolateCtrlGrid(nrs_t *nrs, dfloat time, int tstep,
+                         dfloat last_u_optimal) {
+
+  // Interpolate velocity
+  const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+  occa::memory o_Uavg = tavg::get_o_Uavg();
+  occa::memory o_mean_vx = o_Uavg.slice(1 * fieldOffsetByte, fieldOffsetByte);
+
+  // Interpolate vertical velocity fluctuation
+  occa::memory vx_prime =
+      platform->device.malloc(nrs->fieldOffset, sizeof(dfloat));
+  occa::memory o_vx = nrs->o_U.slice(1 * fieldOffsetByte, fieldOffsetByte);
+  platform->linAlg->axpbyz(nrs->meshV->Nlocal, 1.0, o_vx, -1.0, o_mean_vx,
+                           vx_prime);
+  obsInterpolator->eval(1, nrs->fieldOffset, vx_prime, ctrl_np, o_CtrlUp);
+
+  if (platform->comm.mpiRank == 0) {
+    std::vector<dfloat> CtrlUp(ctrl_np);
+    o_CtrlUp.copyTo(CtrlUp.data());
+
+    std::ofstream fout("control_grid_data.txt", std::ios::trunc); 
+
+    printf("Writing new LSM data into control_grid_data.txt ... ");
+    fout << "#time = " << std::setprecision(7) << std::scientific << time
+         << std::endl;
+    fout << std::setw(15) << std::setprecision(8) << std::scientific
+         << last_u_optimal << std::endl;
+    fout << "#  v_prime " << std::endl;
+
+    for (int i = 0; i < ctrl_np; ++i) {
+      fout << std::setw(15) << std::setprecision(8) << std::scientific
+           << CtrlUp[i] << std::endl;
+    }
+    fout.close();
+    printf("Done \n");
+  }
+}
 
 /* UDF Functions */
 
@@ -374,7 +416,7 @@ void UDF_Setup(nrs_t *nrs) {
   // Time averaging setup
   tavg::setup(nrs);
 
-  //Interpolation setup
+  // Interpolation setup
   setupInterpolators(nrs, obsInterpolator, o_ObsUp, o_ObsUprime, obs_np,
                      ctrlInterpolator, o_CtrlUp, ctrl_np);
 }
@@ -425,6 +467,6 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
     postProcessing::Qcriterion(nrs, o_S0);
 
     interpolateObsGrid(nrs, time, tstep);
-  // interpolateCtrlGrid(nrs, time, tstep);
+    // interpolateCtrlGrid(nrs, time, tstep, u_optimal);
   }
 }
