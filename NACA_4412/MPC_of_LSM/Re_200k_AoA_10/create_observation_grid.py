@@ -52,7 +52,7 @@ def rotate_points(x, y, z, axis, angle, origin):
 if __name__ == '__main__':
     # Define the grid coordinates
     x_ = np.linspace(0.5, 0.6, 101)
-    y_ = np.linspace(0.094, 0.114, 21)
+    y_ = np.linspace(0.0925, 0.114, 21)
     z_ = np.linspace(0.025, 0.075, 21)
 
     # Generate the grid
