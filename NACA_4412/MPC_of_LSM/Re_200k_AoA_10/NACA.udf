@@ -20,6 +20,7 @@
 
 static dfloat U_inf;
 static dfloat AoA;
+
 static dfloat AoA_rad;
 static dfloat tdamp, rota;
 static dfloat sposx, sposy, sposz;
@@ -28,21 +29,24 @@ static dfloat smthx, smthy;
 static dfloat Lz;
 static int nmode;
 static dfloat tdt;
-
 static std::vector<double> phase_current; // For h_i(z), size nmode
 static std::vector<double> phase_next;    // For h_{i+1}(z), size nmode
 static occa::memory o_phase_curr;
 static occa::memory o_phase_next;
-
 static int last_harmonic_index = -1;
 static std::mt19937_64 rng(12345); // seed once (or seed per run)
 static std::uniform_real_distribution<double> U01(0.0, 1.0);
 
-dfloat *dragvx, *dragvy, *dragvz;
-occa::memory o_dragvx, o_dragvy, o_dragvz;
+static dfloat *dragvx, *dragvy, *dragvz;
+static occa::memory o_dragvx, o_dragvy, o_dragvz;
+static dfloat *dragpx, *dragpy, *dragpz;
+static occa::memory o_dragpx, o_dragpy, o_dragpz;
 
-dfloat *dragpx, *dragpy, *dragpz;
-occa::memory o_dragpx, o_dragpy, o_dragpz;
+static dfloat jet_xc, jet_yc, jet_zc;
+static dfloat jet_ax, jet_ay, jet_az;
+static dfloat jet_scale, jet_pitch, jet_rota;
+static dfloat jet_input;
+
 
 struct Force {
   dfloat x;
@@ -198,8 +202,24 @@ void generate_tripping_forces(nrs_t *nrs, dfloat time, occa::memory o_FU) {
   }
 }
 
+void set_jet_field(nrs_t *nrs, dfloat time, occa::memory o_FU){
+  auto *mesh = nrs->meshV;
+  const double cos_rota = std::cos(jet_rota * M_PI / 180.0);
+  const double sin_rota = std::sin(jet_rota * M_PI / 180.0);
+  const double cos_pitch = std::cos(jet_pitch * M_PI / 180.0);
+  const double sin_pitch = std::sin(jet_pitch * M_PI / 180.0);
+
+  const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+  auto o_S2 = nrs->cds->o_S.slice(2 * fieldOffsetByte, fieldOffsetByte);
+
+  fill_FU_jet(mesh->Nlocal, nrs->fieldOffset, mesh->o_x, mesh->o_y, mesh->o_z,
+              jet_xc, jet_yc, jet_zc, jet_ax, jet_ay, jet_az, jet_input, jet_scale,
+              cos_rota, sin_rota, cos_pitch, sin_pitch, o_FU, o_S2);
+}
+
 void userf(nrs_t *nrs, dfloat time, occa::memory o_U, occa::memory o_FU) {
   generate_tripping_forces(nrs, time, o_FU);
+  set_jet_field(nrs,time,o_FU);
 }
 
 // Reads x, y, z coordinates from file and fills vectors
@@ -386,6 +406,16 @@ void UDF_Setup0(MPI_Comm comm, setupAide &options) {
   platform->par->extract("casedata", "NMODE", nmode);
   platform->par->extract("casedata", "TDT", tdt);
 
+  platform->par->extract("casedata","jet_xc", jet_xc);
+  platform->par->extract("casedata","jet_yc", jet_yc);
+  platform->par->extract("casedata","jet_zc", jet_zc);
+  platform->par->extract("casedata","jet_ax", jet_ax);
+  platform->par->extract("casedata","jet_ay", jet_ay);
+  platform->par->extract("casedata","jet_az", jet_az);
+  platform->par->extract("casedata","jet_scale", jet_scale);
+  platform->par->extract("casedata","jet_pitch", jet_pitch);
+  platform->par->extract("casedata","jet_rota", jet_rota);
+
   *((double *)nek::scPtr(1)) = U_inf;
   *((double *)nek::scPtr(2)) = AoA;
 }
@@ -419,6 +449,9 @@ void UDF_Setup(nrs_t *nrs) {
   // Interpolation setup
   setupInterpolators(nrs, obsInterpolator, o_ObsUp, o_ObsUprime, obs_np,
                      ctrlInterpolator, o_CtrlUp, ctrl_np);
+
+  // temporary setting these until MPC 
+  jet_input = 0.0; 
 }
 
 void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
@@ -467,6 +500,8 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
     postProcessing::Qcriterion(nrs, o_S0);
 
     interpolateObsGrid(nrs, time, tstep);
-    // interpolateCtrlGrid(nrs, time, tstep, u_optimal);
+    dfloat u_optimal = 0.0;
+    interpolateCtrlGrid(nrs, time, tstep, u_optimal);
   }
+
 }

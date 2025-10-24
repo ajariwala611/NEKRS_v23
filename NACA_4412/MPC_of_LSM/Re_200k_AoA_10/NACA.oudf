@@ -6,15 +6,13 @@ void velocityDirichletConditions(bcData *bc) {
 // Stabilized outflow (Dong et al)
 void pressureDirichletConditions(bcData *bc) { bc->p = 0.0; }
 
-@kernel void fill_FU_trip(const dlong Ntotal, const dlong offset,
-                     @ restrict const dfloat *X, @ restrict const dfloat *Y,
-                     @ restrict const dfloat *Z, const dfloat x0,
-                     const dfloat y0, const dfloat z0, const dfloat z1,
-                     const dfloat invSmx, const dfloat invSmy,
-                     const dfloat invLz, const dfloat ca, const dfloat sa,
-                     @ restrict const dfloat *phase_curr,
-                     @ restrict const dfloat *phase_next, const int nmode,
-                     const dfloat Tu, const dfloat bt, @ restrict dfloat *F) {
+@kernel void fill_FU_trip(
+    const dlong Ntotal, const dlong offset, @ restrict const dfloat *X,
+    @ restrict const dfloat *Y, @ restrict const dfloat *Z, const dfloat x0,
+    const dfloat y0, const dfloat z0, const dfloat z1, const dfloat invSmx,
+    const dfloat invSmy, const dfloat invLz, const dfloat ca, const dfloat sa,
+    @ restrict const dfloat *phase_curr, @ restrict const dfloat *phase_next,
+    const int nmode, const dfloat Tu, const dfloat bt, @ restrict dfloat *F) {
 
   for (dlong node = 0; node < Ntotal; ++node;
        @tile(p_blockSize, @outer, @inner)) {
@@ -67,5 +65,45 @@ void pressureDirichletConditions(bcData *bc) { bc->p = 0.0; }
     F[node + 0 * offset] = fx;
     F[node + 1 * offset] = fy;
     F[node + 2 * offset] = fz;
+  }
+}
+
+@kernel void fill_FU_jet(const dlong Ntotal, const dlong offset,
+                          @ restrict const dfloat *X,
+                          @ restrict const dfloat *Y,
+                          @ restrict const dfloat *Z, 
+                          const dfloat xc, const dfloat yc, const dfloat zc, 
+                          const dfloat ax, const dfloat ay, const dfloat az, 
+                          const dfloat jet_input,
+                          const dfloat scale,
+                          const dfloat cos_rota, const dfloat sin_rota,
+                          const dfloat cos_pitch, const dfloat sin_pitch,
+                          @ restrict dfloat *F, @ restrict dfloat *S) {
+
+  for (dlong node = 0; node < Ntotal; ++node;
+       @tile(p_blockSize, @outer, @inner)) {
+
+    dfloat fx, fy, fz;
+    const dfloat z = Z[node];
+    const dfloat x = X[node];
+    const dfloat y = Y[node];
+
+    // rotate
+    const dfloat xr = xc + (x - xc) * cos_rota - (y - yc) * sin_rota;
+    const dfloat yr = yc + (x - xc) * sin_rota + (y - yc) * cos_rota;
+    const dfloat zr = z;
+
+    dfloat jet_gain = (xr - xc) / ax * std::exp(1.0 - (xr - xc) / ax) *
+                      std::exp(-0.5 * (std::pow((yr - yc) / ay, 2) +
+                                       std::pow((zr - zc) / az, 2)));
+
+    if (jet_gain >= 0.01) {
+      if (yr >= -0.2 * xr + 0.2) {
+        F[node + 0 * offset] = cos_pitch * scale * jet_input * jet_gain;
+        F[node + 1 * offset] = sin_pitch * scale * jet_input * jet_gain;
+        F[node + 2 * offset] = 0.0;
+        S[node] = scale * jet_gain;
+      }
+    }
   }
 }
