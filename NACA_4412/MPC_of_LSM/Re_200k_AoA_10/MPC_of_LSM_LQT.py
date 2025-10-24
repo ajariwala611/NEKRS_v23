@@ -312,7 +312,7 @@ if __name__ == "__main__":
     # Define the dimensions of the data
     nz, ny, nx = 21, 21, 101  # Replace with actual dimensions
     # Path to the input file
-    lsm_filename = "LSM.txt"
+    lsm_filename = "observation_grid_data.txt"
     
     # Process the file
     u_bar,v_bar,u_prime = read_and_process_file(lsm_filename, nz, ny, nx)
@@ -354,15 +354,15 @@ if __name__ == "__main__":
     Q = 100  # Output cost weight (penalizes output deviation)
     R = 0.1   # Control cost weight (penalizes control effort)
     P = 1 # Terminal cost weight
-    x0 = C.T @ u_prime_filtered.reshape(p,1)  # Initial reducded order state
-    u0 = 0 # Inititla control input, should read that from last QP for continuity
-    # ctrl_grd_filename = "control_grid_data.txt"
-    # u0, v_prime = read_and_process_control_grid(ctrl_grd_filename, nx, ny, nz)
-    # if u0 > 1e-6:
-    #     u0 = 1
-    # print(f" Read data from file: ",ctrl_grd_filename)
-    # x0 = C.T @ v_prime.reshape(p,1) # Initial reducded order state
-    # x0 = np.zeros((n,1))  # Initial state
+    # x0 = C.T @ u_prime_filtered.reshape(p,1)  # Initial reducded order state
+    # u0 = 0 # Inititla control input, should read that from last QP for continuity
+    ctrl_grd_filename = "control_grid_data.txt"
+    u0, v_prime = read_and_process_control_grid(ctrl_grd_filename, nx, ny, nz)
+    if u0 > 1e-6:
+        u0 = 1
+    print(f" Read data from file: ",ctrl_grd_filename)
+    x0 = C.T @ v_prime.reshape(p,1) # Initial reducded order state
+    x0 = np.zeros((n,1))  # Initial state
     
     lamda = 100 # some weight for inducded desried downwash
     y_des = lamda * C.T @ predicted_LSM.reshape(p,N) # Desired downwash in reducded order state

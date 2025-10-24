@@ -47,6 +47,11 @@ static dfloat jet_ax, jet_ay, jet_az;
 static dfloat jet_scale, jet_pitch, jet_rota;
 static dfloat jet_input;
 
+static dfloat mpc_time_delay;
+static dfloat mpc_rom_time;
+static dfloat mpc_time_horizon;
+static dfloat mpc_meas_freq;
+static std::vector<double> u_optimal;
 
 struct Force {
   dfloat x;
@@ -380,12 +385,71 @@ void interpolateCtrlGrid(nrs_t *nrs, dfloat time, int tstep,
   }
 }
 
+void solveQPandBroadcast(int n_mpc_rom, std::vector<double>& u_optimal) {
+  // Only resize if size might change
+  if (u_optimal.size() != n_mpc_rom) {
+      u_optimal.resize(n_mpc_rom);
+  }
+  if (platform->comm.mpiRank == 0) {
+      int ret = system("python MPC_of_LSM_LQT.py");
+      if (ret != 0) {
+          std::cerr << "Error: Python script failed with code " << ret << std::endl;
+          std::exit(EXIT_FAILURE);
+      }
+      std::ifstream fin("u_optimal.txt");
+      if (!fin.is_open()) {
+          std::cerr << "Error opening file: u_optimal.txt" << std::endl;
+          std::exit(EXIT_FAILURE);
+      }
+      for (int i = 0; i < n_mpc_rom; ++i) {
+          if (!(fin >> u_optimal[i])) {
+              std::cerr << "Error reading data at line " << (i + 1) << std::endl;
+              std::exit(EXIT_FAILURE);
+          }
+      }
+      fin.close();
+  }
+  MPI_Bcast(u_optimal.data(), n_mpc_rom, MPI_DOUBLE, 0, platform->comm.mpiComm);
+}
+
+void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep){
+  static bool initialized = false;
+  static double last_mpc_update_time;
+  static std::vector<double> u_optimal;
+
+  if (!initialized) {
+      last_mpc_update_time = time + mpc_time_delay; // first allowed MPC update
+      u_optimal.assign(mpc_time_horizon, 0.0);
+      initialized = true;
+  }
+
+  if (time < last_mpc_update_time) {
+    jet_input = 0.0;
+    return;
+  }
+
+  if (time >= last_mpc_update_time) {
+    interpolateObsGrid(nrs, time, tstep);
+    interpolateCtrlGrid(nrs, time, tstep, jet_input);
+    solveQPandBroadcast(mpc_time_horizon, u_optimal);
+    last_mpc_update_time += mpc_meas_freq; // set next allowed MPC update time
+  }
+  // Compute control index for current time
+  double time_since_mpc = time - last_mpc_update_time + mpc_meas_freq;
+  int ctrl_idx = static_cast<int>(time_since_mpc / mpc_rom_time);
+  if (ctrl_idx >= mpc_time_horizon) ctrl_idx = mpc_time_horizon - 1;
+
+  jet_input = u_optimal[ctrl_idx];
+}
+
 /* UDF Functions */
 
 void UDF_LoadKernels(occa::properties &kernelInfo) {
   kernelInfo["defines/p_U_inf"] = U_inf;
   kernelInfo["defines/p_AoA"] = AoA;
   kernelInfo["defines/p_pi"] = M_PI;
+
+
 }
 
 void UDF_Setup0(MPI_Comm comm, setupAide &options) {
@@ -415,6 +479,11 @@ void UDF_Setup0(MPI_Comm comm, setupAide &options) {
   platform->par->extract("casedata","jet_scale", jet_scale);
   platform->par->extract("casedata","jet_pitch", jet_pitch);
   platform->par->extract("casedata","jet_rota", jet_rota);
+
+  platform->par->extract("casedata","mpc_time_delay", mpc_time_delay);
+  platform->par->extract("casedata","mpc_rom_time", mpc_rom_time);
+  platform->par->extract("casedata","mpc_time_horizon", mpc_time_horizon);
+  platform->par->extract("casedata","mpc_meas_freq", mpc_meas_freq);
 
   *((double *)nek::scPtr(1)) = U_inf;
   *((double *)nek::scPtr(2)) = AoA;
@@ -450,8 +519,6 @@ void UDF_Setup(nrs_t *nrs) {
   setupInterpolators(nrs, obsInterpolator, o_ObsUp, o_ObsUprime, obs_np,
                      ctrlInterpolator, o_CtrlUp, ctrl_np);
 
-  // temporary setting these until MPC 
-  jet_input = 0.0; 
 }
 
 void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
@@ -493,15 +560,11 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
   }
 
   tavg::run(time);
+  MPC_of_LSM(nrs, time, tstep);
 
   if (nrs->isOutputStep) {
     const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
     auto o_S0 = nrs->cds->o_S.slice(0 * fieldOffsetByte, fieldOffsetByte);
     postProcessing::Qcriterion(nrs, o_S0);
-
-    interpolateObsGrid(nrs, time, tstep);
-    dfloat u_optimal = 0.0;
-    interpolateCtrlGrid(nrs, time, tstep, u_optimal);
   }
-
 }
