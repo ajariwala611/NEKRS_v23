@@ -42,6 +42,9 @@ solver = none
 [SCALAR01] #Tripping forcing
 solver = none
 
+[SCALAR02] #u' = u - mean_u
+solver = none
+
 # [BOOMERAMG]
 # coarsenType                 = HMIS              # PMIS also OK
 # interpolationType           = Ext+i             # or modified classical if Ext+i unavailable

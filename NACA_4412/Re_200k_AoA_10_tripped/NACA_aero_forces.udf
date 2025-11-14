@@ -3,6 +3,7 @@
 //
 #include <math.h>
 #include "udf.hpp"
+#include "plugins/tavg.hpp"
 #include <vector>
 #include <cmath>
 #include <random>
@@ -269,6 +270,8 @@ void UDF_Setup(nrs_t *nrs)
   o_phase_next.copyFrom(phase_next.data());
   
   udf.uEqnSource = &userf;
+  //setup for time averaging
+  tavg::setup(nrs);
 
 }
 
@@ -304,12 +307,20 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
     printf("%d %15.8e %15.8e %15.8e %15.8e %15.8e \n", tstep, time, F_drag, F_lift, Cd, Cl);
   }
 
+  // calling time averaging
+  tavg::run(time);
+
   if (nrs->isOutputStep) {
-    // nek::ocopyToNek(time, tstep);
-    // nek::userchk();
     const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
     auto o_S0 =  nrs->cds->o_S.slice(0 * fieldOffsetByte, fieldOffsetByte);
     postProcessing::Qcriterion(nrs, o_S0);
+
+    // storing x_velocity fluctuation
+    occa::memory o_S2 =  nrs->cds->o_S.slice(2 * fieldOffsetByte, fieldOffsetByte);
+    occa::memory U_avg = tavg::get_o_Uavg();
+    occa::memory mean_ux = U_avg.slice(0 * fieldOffsetByte, fieldOffsetByte);
+    occa::memory ux = nrs->o_U.slice(0 * fieldOffsetByte, fieldOffsetByte);
+    platform->linAlg->axpbyz(nrs->meshV->Nlocal,1.0,ux,-1.0,mean_ux,o_S2); //u' = u - mean_u
   }
 
 }
