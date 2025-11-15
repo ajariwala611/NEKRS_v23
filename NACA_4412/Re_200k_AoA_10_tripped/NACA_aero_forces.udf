@@ -285,7 +285,8 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
 {
   // compute drag
   std::vector<int> bidWall = {3};
-  occa::memory o_bidWall = platform->device.malloc(bidWall.size(), bidWall.data());
+  occa::memory o_bidWall =
+      platform->device.malloc(bidWall.size() * sizeof(int), bidWall.data());
 
   const dfloat scale = 1.0; // CD = F/(.5 rho U^2 * A) = 2*F, A=c*Lz, rho=1, U=U_inf
   auto o_Sij = platform->device.malloc(2 * nrs->NVfields * nrs->fieldOffset, sizeof(dfloat));
