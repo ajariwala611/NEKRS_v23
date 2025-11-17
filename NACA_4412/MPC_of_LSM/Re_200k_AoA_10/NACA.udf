@@ -361,7 +361,7 @@ void interpolateCtrlGrid(nrs_t *nrs, dfloat time, int tstep,
   occa::memory o_vx = nrs->o_U.slice(1 * fieldOffsetByte, fieldOffsetByte);
   platform->linAlg->axpbyz(nrs->meshV->Nlocal, 1.0, o_vx, -1.0, o_mean_vx,
                            vx_prime);
-  obsInterpolator->eval(1, nrs->fieldOffset, vx_prime, ctrl_np, o_CtrlUp);
+  ctrlInterpolator->eval(1, nrs->fieldOffset, vx_prime, ctrl_np, o_CtrlUp);
 
   if (platform->comm.mpiRank == 0) {
     std::vector<dfloat> CtrlUp(ctrl_np);
