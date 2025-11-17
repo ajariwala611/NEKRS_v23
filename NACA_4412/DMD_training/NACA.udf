@@ -316,9 +316,9 @@ void interpolateCtrlGrid(nrs_t *nrs, dfloat time, int tstep,
     std::ofstream fout("control_grid_data.dat", std::ios::app);
 
     // Write data row: time tstep last_u_optimal CtrlUp[0] CtrlUp[1]... CtrlUp[N]
-    fout << std::setprecision(7) << std::scientific << time << " ";
+    fout << std::setprecision(4) << std::scientific << time << " ";
     fout << tstep << " ";
-    fout << std::setprecision(8) << std::scientific << last_u_optimal << " ";
+    fout << control_input << " ";
 
     for (int i = 0; i < ctrl_np; ++i) {
       fout << std::setprecision(8) << std::scientific << CtrlUp[i] << " ";
