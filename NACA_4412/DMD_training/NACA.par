@@ -12,8 +12,7 @@ polynomialOrder = 7
 stopAt = endTime
 endTime = 2.575
 
-# dt = targetCFL=3 + max=5e-3 + initial=1e-5
-dt = 2.5e-5
+dt = targetCFL=3.5 + max=2.5e-5
 timeStepper = tombo2
 
 writeControl = simulationTime 
