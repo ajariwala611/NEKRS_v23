@@ -47,6 +47,9 @@ static dfloat jet_ax, jet_ay, jet_az;
 static dfloat jet_scale, jet_pitch, jet_rota;
 static dfloat jet_input;
 
+static std::vector<double> control;
+static dfloat ctrl_steps;
+
 struct Force {
   dfloat x;
   dfloat y;
@@ -283,12 +286,8 @@ void setupInterpolators(nrs_t *nrs, pointInterpolation_t *&ctrlInterpolator,
   }
 }
 
-#include <fstream>
-#include <vector>
-#include <iomanip>
-
 void interpolateCtrlGrid(nrs_t *nrs, dfloat time, int tstep,
-  occa::memory o_Uavg, dfloat control_input) {
+                         occa::memory o_Uavg, dfloat control_input) {
 
   // Interpolate velocity
   const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
@@ -307,9 +306,10 @@ void interpolateCtrlGrid(nrs_t *nrs, dfloat time, int tstep,
     o_CtrlUp.copyTo(CtrlUp.data());
 
     // Open file in append mode
-    std::ofstream fout("control_grid_data.dat", std::ios::app);
+    std::ofstream fout("control_grid_data.txt", std::ios::app);
 
-    // Write data row: time tstep last_u_optimal CtrlUp[0] CtrlUp[1]... CtrlUp[N]
+    // Write data row: time tstep last_u_optimal CtrlUp[0] CtrlUp[1]...
+    // CtrlUp[N]
     fout << std::setprecision(4) << std::scientific << time << " ";
     fout << tstep << " ";
     fout << control_input << " ";
@@ -324,51 +324,45 @@ void interpolateCtrlGrid(nrs_t *nrs, dfloat time, int tstep,
   }
 }
 
+void DMDc_init() {
+  // if (platform->comm.mpiRank == 0) {
+  std::ifstream infile("jet_input_training_testing.txt");
+  if (!infile.is_open()) {
+    std::cerr << "Error opening file: jet_input_training_testing.txt"
+              << std::endl;
+    return;
+  }
+
+  // Read number of points
+  infile >> ctrl_steps;
+  control.resize(ctrl_steps);
+
+  // Read control values directly
+  for (int i = 0; i < ctrl_steps; ++i) {
+    infile >> control[i];
+  }
+  // }
+  // MPI_Bcast(control.data(), ctrl_steps, MPI_DFLOAT, 0,
+  // platform->comm.mpiComm);
+  jet_input = 0.0;
+}
 
 void DMDc(nrs_t *nrs, dfloat time, int tstep) {
   static bool initialized = false;
   static occa::memory o_Uavg;
-  static int ctrl_steps = 0;
   static int ctrl_offset = 0;
-  static std::vector<double> control;
 
   if (!initialized) {
     o_Uavg = tavg::get_o_Uavg();
     ctrl_offset = tstep;
-
-    if (platform->comm.mpiRank == 0) {
-      std::ifstream infile("jet_input_training_testing.dat");
-      if (!infile.is_open()) {
-          std::cerr << "Error opening file: jet_input_training_testing.dat" << std::endl;
-          return;
-      }
-      std::string line;
-      // Read number of points
-      if (std::getline(infile, line)) {
-          std::istringstream iss(line);
-          iss >> ctrl_steps;
-      }
-      control.reserve(ctrl_steps);
-      // Read control values
-      int count = 0;
-      while (std::getline(infile, line) && count < ctrl_steps) {
-        std::istringstream iss(line);
-        dfloat val;
-        if (iss >> val) {
-            control.push_back(val);
-            ++count;
-        }
-      }
-    }
-    MPI_Bcast(control.data(), ctrl_steps, MPI_DFLOAT, 0, platform->comm.mpiComm);
     initialized = true;
   }
 
   int idx = tstep - ctrl_offset;
   if (idx >= 0 && idx < ctrl_steps) {
-      jet_input = control[idx];
+    jet_input = control[idx];
   } else {
-      jet_input = 0.0;
+    jet_input = 0.0;
   }
 
   // Calling this every 40 becasue ROM = 40 * dt = 1e-3
@@ -415,7 +409,6 @@ void UDF_Setup0(MPI_Comm comm, setupAide &options) {
 
   *((double *)nek::scPtr(1)) = U_inf;
   *((double *)nek::scPtr(2)) = AoA;
-
 }
 
 void UDF_Setup(nrs_t *nrs) {
@@ -450,7 +443,7 @@ void UDF_Setup(nrs_t *nrs) {
   // Interpolation setup
   setupInterpolators(nrs, ctrlInterpolator, o_CtrlUp, ctrl_np);
 
-  jet_input = 0.0;
+  DMDc_init();
 }
 
 void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
@@ -492,11 +485,11 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
   }
 
   tavg::run(time);
-  
-  if (time >= 2.0){
+
+  if (time >= 2.0) {
     DMDc(nrs, time, tstep);
   }
-  
+
   if (nrs->isOutputStep) {
     const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
     auto o_S0 = nrs->cds->o_S.slice(0 * fieldOffsetByte, fieldOffsetByte);
