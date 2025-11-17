@@ -80,7 +80,3 @@ jet_az = 0.0062     # Width is about 4xjet_az ~ magnitude > 0.01
 jet_scale = 5.0     # Scaling parameter for forces
 jet_pitch = -45     # pitch angle for forces in degree
 jet_rota = 11       # roation angle for jet field in degree
-mpc_time_delay = 0.0    # time delay to start MPC
-mpc_rom_time = 1e-3     # ROM time step: ROM is trained on every 10 LES time and each was dt=1e-4
-mpc_time_horizon = 50   # Time horizon for control problem in ROM time steps
-mpc_meas_freq = 0.01    # Time between consecutive new measurements resolve MPC-QP

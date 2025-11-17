@@ -47,12 +47,6 @@ static dfloat jet_ax, jet_ay, jet_az;
 static dfloat jet_scale, jet_pitch, jet_rota;
 static dfloat jet_input;
 
-static dfloat mpc_time_delay;
-static dfloat mpc_rom_time;
-static dfloat mpc_time_horizon;
-static dfloat mpc_meas_freq;
-static std::vector<double> u_optimal;
-
 struct Force {
   dfloat x;
   dfloat y;
@@ -419,15 +413,9 @@ void UDF_Setup0(MPI_Comm comm, setupAide &options) {
   platform->par->extract("casedata", "jet_pitch", jet_pitch);
   platform->par->extract("casedata", "jet_rota", jet_rota);
 
-  platform->par->extract("casedata", "mpc_time_delay", mpc_time_delay);
-  platform->par->extract("casedata", "mpc_rom_time", mpc_rom_time);
-  platform->par->extract("casedata", "mpc_time_horizon", mpc_time_horizon);
-  platform->par->extract("casedata", "mpc_meas_freq", mpc_meas_freq);
-
   *((double *)nek::scPtr(1)) = U_inf;
   *((double *)nek::scPtr(2)) = AoA;
 
-  jet_input = 0.0;
 }
 
 void UDF_Setup(nrs_t *nrs) {
@@ -461,6 +449,8 @@ void UDF_Setup(nrs_t *nrs) {
 
   // Interpolation setup
   setupInterpolators(nrs, ctrlInterpolator, o_CtrlUp, ctrl_np);
+
+  jet_input = 0.0;
 }
 
 void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
@@ -502,6 +492,7 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
   }
 
   tavg::run(time);
+  
   if (time >= 2.0){
     DMDc(nrs, time, tstep);
   }
