@@ -426,6 +426,8 @@ void UDF_Setup0(MPI_Comm comm, setupAide &options) {
 
   *((double *)nek::scPtr(1)) = U_inf;
   *((double *)nek::scPtr(2)) = AoA;
+
+  jet_input = 0.0
 }
 
 void UDF_Setup(nrs_t *nrs) {
