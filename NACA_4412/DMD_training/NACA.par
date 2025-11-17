@@ -7,7 +7,7 @@ deviceNumber = LOCAL-RANK
 
 [GENERAL]
 #verbose = true
-startFrom = "NACA0.f00015"+time=0.0
+startFrom = "NACA0.f00015+time=0.0"
 polynomialOrder = 7
 stopAt = endTime
 endTime = 2.575
