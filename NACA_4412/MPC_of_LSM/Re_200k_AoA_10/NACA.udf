@@ -420,12 +420,13 @@ void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep){
   static std::vector<double> u_optimal;
 
   if (!initialized) {
-      last_mpc_update_time = time + mpc_time_delay; // first allowed MPC update
-      u_optimal.assign(mpc_time_horizon, 0.0);
-      initialized = true;
+    mpc_time_delay += time; // first allowed MPC update
+    last_mpc_update_time = mpc_time_delay;
+    u_optimal.assign(mpc_time_horizon, 0.0);
+    initialized = true;
   }
 
-  if (time < last_mpc_update_time) {
+  if (time < mpc_time_delay) {
     jet_input = 0.0;
     if (platform->comm.mpiRank == 0) {
       std::ofstream fout("jet_input.txt", std::ios::app);
