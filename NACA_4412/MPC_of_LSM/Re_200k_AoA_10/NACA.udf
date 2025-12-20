@@ -427,6 +427,15 @@ void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep){
 
   if (time < last_mpc_update_time) {
     jet_input = 0.0;
+    if (platform->comm.mpiRank == 0) {
+      std::ofstream fout("jet_input.txt", std::ios::app);
+      // First three columns: width 6, default notation
+      fout << std::setw(6) << tstep << " ";
+      fout << std::setw(6) << std::setprecision(4) << std::scientific << time
+           << " ";
+      fout << std::setw(6) << std::setprecision(4) << jet_input << std::endl;
+      fout.close();
+    }
     return;
   }
 
@@ -442,6 +451,17 @@ void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep){
   if (ctrl_idx >= mpc_time_horizon) ctrl_idx = mpc_time_horizon - 1;
 
   jet_input = u_optimal[ctrl_idx];
+  if (platform->comm.mpiRank == 0) {
+    printf("%d %15.8e ctrl_idx: %d u_optimal: %15.8e jet_input: %15.8e \n", tstep, time, ctrl_idx,
+      u_optimal[ctrl_idx], jet_input);
+    std::ofstream fout("jet_input.txt", std::ios::app);
+    // First three columns: width 6, default notation
+    fout << std::setw(6) << tstep << " ";
+    fout << std::setw(6) << std::setprecision(4) << std::scientific << time
+         << " ";
+    fout << std::setw(6) << std::setprecision(4) << jet_input << std::endl;
+    fout.close();
+  }
 }
 
 /* UDF Functions */
@@ -555,6 +575,12 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
   double Cl = F_lift / (0.5 * Lz);
 
   if (platform->comm.mpiRank == 0) {
+
+    std::ofstream drag_file("drag.txt", std::ios::app);
+    std::ofstream lift_file("lift.txt", std::ios::app);
+    std::ofstream dragz_file("dragz.txt", std::ios::app);
+    std::ofstream forces_file("forces.txt", std::ios::app);
+
     printf("%d %15.8e %15.8e %15.8e %15.8e dragx(rs)\n", tstep, time, drag.x,
            dragp.x, dragv.x);
     printf("%d %15.8e %15.8e %15.8e %15.8e dragy(rs)\n", tstep, time, drag.y,
@@ -563,9 +589,55 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
            dragp.z, dragv.z);
     printf("%d %15.8e %15.8e %15.8e %15.8e %15.8e \n", tstep, time, F_drag,
            F_lift, Cd, Cl);
+    
+    // Set field width and precision
+    const int width_int = 6;      // for tstep
+    const int width_float = 15;   // for floating point numbers
+
+    // Write drag.txt
+    if (drag_file.is_open()) {
+        drag_file << std::setw(width_int) << tstep << " "
+                  << std::setw(width_float) << std::setprecision(8) << std::scientific << time << " "
+                  << std::setw(width_float) << drag.x << " "
+                  << std::setw(width_float) << dragp.x << " "
+                  << std::setw(width_float) << dragv.x << "\n";
+        drag_file.close();
+    }
+
+    // Write lift.txt
+    if (lift_file.is_open()) {
+        lift_file << std::setw(width_int) << tstep << " "
+                  << std::setw(width_float) << std::setprecision(8) << std::scientific << time << " "
+                  << std::setw(width_float) << drag.y << " "
+                  << std::setw(width_float) << dragp.y << " "
+                  << std::setw(width_float) << dragv.y << "\n";
+        lift_file.close();
+    }
+
+    // Write dragz.txt
+    if (dragz_file.is_open()) {
+        dragz_file << std::setw(width_int) << tstep << " "
+                   << std::setw(width_float) << std::setprecision(8) << std::scientific << time << " "
+                   << std::setw(width_float) << drag.z << " "
+                   << std::setw(width_float) << dragp.z << " "
+                   << std::setw(width_float) << dragv.z << "\n";
+        dragz_file.close();
+    }
+
+    // Write forces.txt
+    if (forces_file.is_open()) {
+        forces_file << std::setw(width_int) << tstep << " "
+                    << std::setw(width_float) << std::setprecision(8) << std::scientific << time << " "
+                    << std::setw(width_float) << F_drag << " "
+                    << std::setw(width_float) << F_lift << " "
+                    << std::setw(width_float) << Cd << " "
+                    << std::setw(width_float) << Cl << "\n";
+        forces_file.close();
+    }
+    
   }
 
-  tavg::run(time);
+  // tavg::run(time);
   MPC_of_LSM(nrs, time, tstep);
 
   if (nrs->isOutputStep) {
