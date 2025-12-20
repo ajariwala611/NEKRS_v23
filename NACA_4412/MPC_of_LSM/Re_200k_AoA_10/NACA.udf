@@ -59,7 +59,7 @@ struct Force {
   dfloat z;
 };
 
-static occa::memory o_ObsUp, o_ObsUprime, o_CtrlUp;
+static occa::memory o_ObsUbar, o_ObsVbar, o_ObsUprime, o_CtrlVprime;
 static pointInterpolation_t *obsInterpolator = nullptr,
                             *ctrlInterpolator = nullptr;
 static int obs_np = 0, ctrl_np = 0;
@@ -217,11 +217,11 @@ void set_jet_field(nrs_t *nrs, dfloat time, occa::memory o_FU){
   const double sin_pitch = std::sin(jet_pitch * M_PI / 180.0);
 
   const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
-  auto o_S2 = nrs->cds->o_S.slice(2 * fieldOffsetByte, fieldOffsetByte);
+  auto o_S0 = nrs->cds->o_S.slice(0 * fieldOffsetByte, fieldOffsetByte);
 
   fill_FU_jet(mesh->Nlocal, nrs->fieldOffset, mesh->o_x, mesh->o_y, mesh->o_z,
-              jet_xc, jet_yc, jet_zc, jet_ax, jet_ay, jet_az, jet_input, jet_scale,
-              cos_rota, sin_rota, cos_pitch, sin_pitch, o_FU, o_S2);
+              jet_xc, jet_yc, jet_zc, jet_ax, jet_ay, jet_az, jet_input,
+              jet_scale, cos_rota, sin_rota, cos_pitch, sin_pitch, o_FU, o_S0);
 }
 
 void userf(nrs_t *nrs, dfloat time, occa::memory o_U, occa::memory o_FU) {
@@ -274,9 +274,10 @@ void readGridFile(const std::string &filename, std::vector<dfloat> &x,
 }
 
 void setupInterpolators(nrs_t *nrs, pointInterpolation_t *&obsInterpolator,
-                        occa::memory &o_ObsUp, occa::memory &o_ObsUprime,
-                        int &obs_np, pointInterpolation_t *&ctrlInterpolator,
-                        occa::memory &o_CtrlUp, int &ctrl_np) {
+                        occa::memory &o_ObsUbar, occa::memory &o_ObsVbar,
+                        occa::memory &o_ObsUprime, int &obs_np,
+                        pointInterpolation_t *&ctrlInterpolator,
+                        occa::memory &o_CtrlVprime, int &ctrl_np) {
 
   static std::vector<dfloat> obs_x, obs_y, obs_z;
   static std::vector<dfloat> ctrl_x, ctrl_y, ctrl_z;
@@ -286,7 +287,8 @@ void setupInterpolators(nrs_t *nrs, pointInterpolation_t *&obsInterpolator,
     readGridFile("observation_grid.txt", obs_x, obs_y, obs_z,
                  platform->comm.mpiRank);
     obs_np = obs_x.size();
-    o_ObsUp = platform->device.malloc(nrs->NVfields * obs_np, sizeof(dfloat));
+    o_ObsUbar = platform->device.malloc(obs_np, sizeof(dfloat));
+    o_ObsVbar = platform->device.malloc(obs_np, sizeof(dfloat));
     o_ObsUprime = platform->device.malloc(obs_np, sizeof(dfloat));
     obsInterpolator = new pointInterpolation_t(nrs);
     obsInterpolator->setPoints(obs_np, obs_x.data(), obs_y.data(),
@@ -297,7 +299,7 @@ void setupInterpolators(nrs_t *nrs, pointInterpolation_t *&obsInterpolator,
     readGridFile("control_grid.txt", ctrl_x, ctrl_y, ctrl_z,
                  platform->comm.mpiRank);
     ctrl_np = ctrl_x.size();
-    o_CtrlUp = platform->device.malloc(ctrl_np, sizeof(dfloat));
+    o_CtrlVprime = platform->device.malloc(ctrl_np, sizeof(dfloat));
     ctrlInterpolator = new pointInterpolation_t(nrs);
     ctrlInterpolator->setPoints(ctrl_np, ctrl_x.data(), ctrl_y.data(),
                                 ctrl_z.data());
@@ -305,28 +307,34 @@ void setupInterpolators(nrs_t *nrs, pointInterpolation_t *&obsInterpolator,
   }
 }
 
-void interpolateObsGrid(nrs_t *nrs, dfloat time, int tstep) {
-
+void interpolateObsGrid(nrs_t *nrs, dfloat time, int tstep,
+                        occa::memory o_mean_vx, occa::memory o_mean_vy) {
+  
+  static bool initialized = false;
+  if (!initialized) {
+    // Interpolate U_bar fluctuation
+    obsInterpolator->eval(1, nrs->fieldOffset, o_mean_vx, obs_np, o_ObsUbar);
+    // Interpolate V_bar fluctuation
+    obsInterpolator->eval(1, nrs->fieldOffset, o_mean_vy, obs_np, o_ObsVbar);
+    initialized = true;
+  }
   // Interpolate velocity
   const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
-  occa::memory o_Uavg = tavg::get_o_Uavg();
-  occa::memory o_mean_ux = o_Uavg.slice(0 * fieldOffsetByte, fieldOffsetByte);
-  obsInterpolator->eval(nrs->NVfields, nrs->fieldOffset, o_Uavg, obs_np,
-                        o_ObsUp);
 
   // Interpolate velocity fluctuation (if available)
   occa::memory ux_prime =
       platform->device.malloc(nrs->fieldOffset, sizeof(dfloat));
   occa::memory o_ux = nrs->o_U.slice(0 * fieldOffsetByte, fieldOffsetByte);
-  platform->linAlg->axpbyz(nrs->meshV->Nlocal, 1.0, o_ux, -1.0, o_mean_ux,
+  platform->linAlg->axpbyz(nrs->meshV->Nlocal, 1.0, o_ux, -1.0, o_mean_vx,
                            ux_prime);
   obsInterpolator->eval(1, nrs->fieldOffset, ux_prime, obs_np, o_ObsUprime);
 
   if (platform->comm.mpiRank == 0) {
-    std::vector<dfloat> ObsUp(nrs->NVfields * obs_np);
-    o_ObsUp.copyTo(ObsUp.data());
-
+    std::vector<dfloat> ObsUbar(obs_np);
+    std::vector<dfloat> ObsVbar(obs_np);
     std::vector<dfloat> ObsUprime(obs_np);
+    o_ObsUbar.copyTo(ObsUbar.data());
+    o_ObsVbar.copyTo(ObsVbar.data());
     o_ObsUprime.copyTo(ObsUprime.data());
 
     std::ofstream fout("observation_grid_data.txt",
@@ -339,10 +347,10 @@ void interpolateObsGrid(nrs_t *nrs, dfloat time, int tstep) {
 
     for (int i = 0; i < obs_np; ++i) {
       fout << std::setw(15) << std::setprecision(8) << std::scientific
-           << ObsUp[i + 0 * obs_np] << " " << std::setw(15)
-           << std::setprecision(8) << std::scientific << ObsUp[i + 1 * obs_np]
-           << " " << std::setw(15) << std::setprecision(8) << std::scientific
-           << ObsUprime[i] << std::endl;
+           << ObsUbar[i] << " " << std::setw(15) << std::setprecision(8)
+           << std::scientific << ObsVbar[i] << " " << std::setw(15)
+           << std::setprecision(8) << std::scientific << ObsUprime[i]
+           << std::endl;
     }
     fout.close();
     printf("Done \n");
@@ -350,26 +358,24 @@ void interpolateObsGrid(nrs_t *nrs, dfloat time, int tstep) {
 }
 
 void interpolateCtrlGrid(nrs_t *nrs, dfloat time, int tstep,
-                         dfloat last_u_optimal) {
+                         dfloat last_u_optimal, occa::memory o_mean_vy) {
 
   // Interpolate velocity
   const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
-  occa::memory o_Uavg = tavg::get_o_Uavg();
-  occa::memory o_mean_vx = o_Uavg.slice(1 * fieldOffsetByte, fieldOffsetByte);
 
   // Interpolate vertical velocity fluctuation
-  occa::memory vx_prime =
+  occa::memory vy_prime =
       platform->device.malloc(nrs->fieldOffset, sizeof(dfloat));
-  occa::memory o_vx = nrs->o_U.slice(1 * fieldOffsetByte, fieldOffsetByte);
-  platform->linAlg->axpbyz(nrs->meshV->Nlocal, 1.0, o_vx, -1.0, o_mean_vx,
-                           vx_prime);
-  ctrlInterpolator->eval(1, nrs->fieldOffset, vx_prime, ctrl_np, o_CtrlUp);
+  occa::memory o_vy = nrs->o_U.slice(1 * fieldOffsetByte, fieldOffsetByte);
+  platform->linAlg->axpbyz(nrs->meshV->Nlocal, 1.0, o_vy, -1.0, o_mean_vy,
+                           vy_prime);
+  ctrlInterpolator->eval(1, nrs->fieldOffset, vy_prime, ctrl_np, o_CtrlVprime);
 
   if (platform->comm.mpiRank == 0) {
-    std::vector<dfloat> CtrlUp(ctrl_np);
-    o_CtrlUp.copyTo(CtrlUp.data());
+    std::vector<dfloat> CtrlVprime(ctrl_np);
+    o_CtrlVprime.copyTo(CtrlVprime.data());
 
-    std::ofstream fout("control_grid_data.txt", std::ios::trunc); 
+    std::ofstream fout("control_grid_data.txt", std::ios::trunc);
 
     printf("Writing new LSM data into control_grid_data.txt ... ");
     fout << "#time = " << std::setprecision(7) << std::scientific << time
@@ -380,7 +386,7 @@ void interpolateCtrlGrid(nrs_t *nrs, dfloat time, int tstep,
 
     for (int i = 0; i < ctrl_np; ++i) {
       fout << std::setw(15) << std::setprecision(8) << std::scientific
-           << CtrlUp[i] << std::endl;
+           << CtrlVprime[i] << std::endl;
     }
     fout.close();
     printf("Done \n");
@@ -418,8 +424,12 @@ void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep){
   static bool initialized = false;
   static double last_mpc_update_time;
   static std::vector<double> u_optimal;
+  static occa::memory o_mean_vx, o_mean_vy;
 
   if (!initialized) {
+    const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+    o_mean_vx = nrs->cds->o_S.slice(2 * fieldOffsetByte, fieldOffsetByte);
+    o_mean_vy = nrs->cds->o_S.slice(3 * fieldOffsetByte, fieldOffsetByte);
     mpc_time_delay += time; // first allowed MPC update
     last_mpc_update_time = mpc_time_delay;
     u_optimal.assign(mpc_time_horizon, 0.0);
@@ -441,8 +451,8 @@ void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep){
   }
 
   if (time >= last_mpc_update_time) {
-    interpolateObsGrid(nrs, time, tstep);
-    interpolateCtrlGrid(nrs, time, tstep, jet_input);
+    interpolateObsGrid(nrs, time, tstep, o_mean_vx, o_mean_vy);
+    interpolateCtrlGrid(nrs, time, tstep, jet_input, o_mean_vy);
     solveQPandBroadcast(mpc_time_horizon, u_optimal);
     last_mpc_update_time += mpc_meas_freq; // set next allowed MPC update time
   }
@@ -471,8 +481,6 @@ void UDF_LoadKernels(occa::properties &kernelInfo) {
   kernelInfo["defines/p_U_inf"] = U_inf;
   kernelInfo["defines/p_AoA"] = AoA;
   kernelInfo["defines/p_pi"] = M_PI;
-
-
 }
 
 void UDF_Setup0(MPI_Comm comm, setupAide &options) {
@@ -543,19 +551,18 @@ void UDF_Setup(nrs_t *nrs) {
   tavg::setup(nrs);
 
   // Interpolation setup
-  setupInterpolators(nrs, obsInterpolator, o_ObsUp, o_ObsUprime, obs_np,
-                     ctrlInterpolator, o_CtrlUp, ctrl_np);
-
+  setupInterpolators(nrs, obsInterpolator, o_ObsUbar, o_ObsVbar, o_ObsUprime,
+                     obs_np, ctrlInterpolator, o_CtrlVprime, ctrl_np);
 }
 
 void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
   // compute drag
   std::vector<int> bidWall = {3};
   occa::memory o_bidWall =
-      platform->device.malloc(bidWall.size(), bidWall.data());
+      platform->device.malloc(bidWall.size() * sizeof(int), bidWall.data());
 
-  const dfloat scale =
-      1.0; // CD = F/(.5 rho U^2 * A) = 2*F, A=c*Lz, rho=1, U=U_inf
+  // C = F/(.5 rho U^2 * A) = 2*F, A=c*Lz, rho=1, U=U_inf
+  const dfloat scale = 1.0;
   auto o_Sij = platform->device.malloc(2 * nrs->NVfields * nrs->fieldOffset,
                                        sizeof(dfloat));
   postProcessing::strainRate(nrs, true, o_Sij); // "false" is correct
