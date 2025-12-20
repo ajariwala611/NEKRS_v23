@@ -209,7 +209,7 @@ void generate_tripping_forces(nrs_t *nrs, dfloat time, occa::memory o_FU) {
   }
 }
 
-void set_jet_field(nrs_t *nrs, dfloat time, occa::memory o_FU){
+void set_jet_field(nrs_t *nrs, dfloat time, occa::memory o_FU) {
   auto *mesh = nrs->meshV;
   const double cos_rota = std::cos(jet_rota * M_PI / 180.0);
   const double sin_rota = std::sin(jet_rota * M_PI / 180.0);
@@ -226,7 +226,7 @@ void set_jet_field(nrs_t *nrs, dfloat time, occa::memory o_FU){
 
 void userf(nrs_t *nrs, dfloat time, occa::memory o_U, occa::memory o_FU) {
   generate_tripping_forces(nrs, time, o_FU);
-  set_jet_field(nrs,time,o_FU);
+  set_jet_field(nrs, time, o_FU);
 }
 
 // Reads x, y, z coordinates from file and fills vectors
@@ -309,7 +309,7 @@ void setupInterpolators(nrs_t *nrs, pointInterpolation_t *&obsInterpolator,
 
 void interpolateObsGrid(nrs_t *nrs, dfloat time, int tstep,
                         occa::memory o_mean_vx, occa::memory o_mean_vy) {
-  
+
   static bool initialized = false;
   if (!initialized) {
     // Interpolate U_bar fluctuation
@@ -393,34 +393,34 @@ void interpolateCtrlGrid(nrs_t *nrs, dfloat time, int tstep,
   }
 }
 
-void solveQPandBroadcast(int n_mpc_rom, std::vector<double>& u_optimal) {
+void solveQPandBroadcast(int n_mpc_rom, std::vector<double> &u_optimal) {
   // Only resize if size might change
   if (u_optimal.size() != n_mpc_rom) {
-      u_optimal.resize(n_mpc_rom);
+    u_optimal.resize(n_mpc_rom);
   }
   if (platform->comm.mpiRank == 0) {
-      int ret = system("python MPC_of_LSM_LQT.py");
-      if (ret != 0) {
-          std::cerr << "Error: Python script failed with code " << ret << std::endl;
-          std::exit(EXIT_FAILURE);
+    int ret = system("python3 MPC_of_LSM_LQT.py");
+    if (ret != 0) {
+      std::cerr << "Error: Python script failed with code " << ret << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    std::ifstream fin("u_optimal.txt");
+    if (!fin.is_open()) {
+      std::cerr << "Error opening file: u_optimal.txt" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < n_mpc_rom; ++i) {
+      if (!(fin >> u_optimal[i])) {
+        std::cerr << "Error reading data at line " << (i + 1) << std::endl;
+        std::exit(EXIT_FAILURE);
       }
-      std::ifstream fin("u_optimal.txt");
-      if (!fin.is_open()) {
-          std::cerr << "Error opening file: u_optimal.txt" << std::endl;
-          std::exit(EXIT_FAILURE);
-      }
-      for (int i = 0; i < n_mpc_rom; ++i) {
-          if (!(fin >> u_optimal[i])) {
-              std::cerr << "Error reading data at line " << (i + 1) << std::endl;
-              std::exit(EXIT_FAILURE);
-          }
-      }
-      fin.close();
+    }
+    fin.close();
   }
   MPI_Bcast(u_optimal.data(), n_mpc_rom, MPI_DOUBLE, 0, platform->comm.mpiComm);
 }
 
-void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep){
+void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep) {
   static bool initialized = false;
   static double last_mpc_update_time;
   static std::vector<double> u_optimal;
@@ -459,7 +459,8 @@ void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep){
   // Compute control index for current time
   double time_since_mpc = time - last_mpc_update_time + mpc_meas_freq;
   int ctrl_idx = static_cast<int>(time_since_mpc / mpc_rom_time);
-  if (ctrl_idx >= mpc_time_horizon) ctrl_idx = mpc_time_horizon - 1;
+  if (ctrl_idx >= mpc_time_horizon)
+    ctrl_idx = mpc_time_horizon - 1;
 
   jet_input = u_optimal[ctrl_idx];
   if (platform->comm.mpiRank == 0) {
@@ -501,20 +502,20 @@ void UDF_Setup0(MPI_Comm comm, setupAide &options) {
   platform->par->extract("casedata", "NMODE", nmode);
   platform->par->extract("casedata", "TDT", tdt);
 
-  platform->par->extract("casedata","jet_xc", jet_xc);
-  platform->par->extract("casedata","jet_yc", jet_yc);
-  platform->par->extract("casedata","jet_zc", jet_zc);
-  platform->par->extract("casedata","jet_ax", jet_ax);
-  platform->par->extract("casedata","jet_ay", jet_ay);
-  platform->par->extract("casedata","jet_az", jet_az);
-  platform->par->extract("casedata","jet_scale", jet_scale);
-  platform->par->extract("casedata","jet_pitch", jet_pitch);
-  platform->par->extract("casedata","jet_rota", jet_rota);
+  platform->par->extract("casedata", "jet_xc", jet_xc);
+  platform->par->extract("casedata", "jet_yc", jet_yc);
+  platform->par->extract("casedata", "jet_zc", jet_zc);
+  platform->par->extract("casedata", "jet_ax", jet_ax);
+  platform->par->extract("casedata", "jet_ay", jet_ay);
+  platform->par->extract("casedata", "jet_az", jet_az);
+  platform->par->extract("casedata", "jet_scale", jet_scale);
+  platform->par->extract("casedata", "jet_pitch", jet_pitch);
+  platform->par->extract("casedata", "jet_rota", jet_rota);
 
-  platform->par->extract("casedata","mpc_time_delay", mpc_time_delay);
-  platform->par->extract("casedata","mpc_rom_time", mpc_rom_time);
-  platform->par->extract("casedata","mpc_time_horizon", mpc_time_horizon);
-  platform->par->extract("casedata","mpc_meas_freq", mpc_meas_freq);
+  platform->par->extract("casedata", "mpc_time_delay", mpc_time_delay);
+  platform->par->extract("casedata", "mpc_rom_time", mpc_rom_time);
+  platform->par->extract("casedata", "mpc_time_horizon", mpc_time_horizon);
+  platform->par->extract("casedata", "mpc_meas_freq", mpc_meas_freq);
 
   *((double *)nek::scPtr(1)) = U_inf;
   *((double *)nek::scPtr(2)) = AoA;
@@ -597,52 +598,51 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
            dragp.z, dragv.z);
     printf("%d %15.8e %15.8e %15.8e %15.8e %15.8e \n", tstep, time, F_drag,
            F_lift, Cd, Cl);
-    
+
     // Set field width and precision
-    const int width_int = 6;      // for tstep
-    const int width_float = 15;   // for floating point numbers
+    const int width_int = 6;    // for tstep
+    const int width_float = 15; // for floating point numbers
 
     // Write drag.txt
     if (drag_file.is_open()) {
-        drag_file << std::setw(width_int) << tstep << " "
-                  << std::setw(width_float) << std::setprecision(8) << std::scientific << time << " "
-                  << std::setw(width_float) << drag.x << " "
-                  << std::setw(width_float) << dragp.x << " "
-                  << std::setw(width_float) << dragv.x << "\n";
-        drag_file.close();
+      drag_file << std::setw(width_int) << tstep << " "
+                << std::setw(width_float) << std::setprecision(8)
+                << std::scientific << time << " " << std::setw(width_float)
+                << drag.x << " " << std::setw(width_float) << dragp.x << " "
+                << std::setw(width_float) << dragv.x << "\n";
+      drag_file.close();
     }
 
     // Write lift.txt
     if (lift_file.is_open()) {
-        lift_file << std::setw(width_int) << tstep << " "
-                  << std::setw(width_float) << std::setprecision(8) << std::scientific << time << " "
-                  << std::setw(width_float) << drag.y << " "
-                  << std::setw(width_float) << dragp.y << " "
-                  << std::setw(width_float) << dragv.y << "\n";
-        lift_file.close();
+      lift_file << std::setw(width_int) << tstep << " "
+                << std::setw(width_float) << std::setprecision(8)
+                << std::scientific << time << " " << std::setw(width_float)
+                << drag.y << " " << std::setw(width_float) << dragp.y << " "
+                << std::setw(width_float) << dragv.y << "\n";
+      lift_file.close();
     }
 
     // Write dragz.txt
     if (dragz_file.is_open()) {
-        dragz_file << std::setw(width_int) << tstep << " "
-                   << std::setw(width_float) << std::setprecision(8) << std::scientific << time << " "
-                   << std::setw(width_float) << drag.z << " "
-                   << std::setw(width_float) << dragp.z << " "
-                   << std::setw(width_float) << dragv.z << "\n";
-        dragz_file.close();
+      dragz_file << std::setw(width_int) << tstep << " "
+                 << std::setw(width_float) << std::setprecision(8)
+                 << std::scientific << time << " " << std::setw(width_float)
+                 << drag.z << " " << std::setw(width_float) << dragp.z << " "
+                 << std::setw(width_float) << dragv.z << "\n";
+      dragz_file.close();
     }
 
     // Write forces.txt
     if (forces_file.is_open()) {
-        forces_file << std::setw(width_int) << tstep << " "
-                    << std::setw(width_float) << std::setprecision(8) << std::scientific << time << " "
-                    << std::setw(width_float) << F_drag << " "
-                    << std::setw(width_float) << F_lift << " "
-                    << std::setw(width_float) << Cd << " "
-                    << std::setw(width_float) << Cl << "\n";
-        forces_file.close();
+      forces_file << std::setw(width_int) << tstep << " "
+                  << std::setw(width_float) << std::setprecision(8)
+                  << std::scientific << time << " " << std::setw(width_float)
+                  << F_drag << " " << std::setw(width_float) << F_lift << " "
+                  << std::setw(width_float) << Cd << " "
+                  << std::setw(width_float) << Cl << "\n";
+      forces_file.close();
     }
-    
   }
 
   // tavg::run(time);
