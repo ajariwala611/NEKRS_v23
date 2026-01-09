@@ -82,8 +82,10 @@ void generate_tripping_forces(nrs_t *nrs, dfloat time, occa::memory o_FU)
     // phase_current <- phase_next (device-to-device copy)
     o_phase_curr.copyFrom(o_phase_next, nmode*sizeof(dfloat));
     // phase_next <- new random (host -> device)
-    randomize_modes(phase_next);
-    o_phase_next.copyFrom(phase_next.data(), nmode*sizeof(dfloat));
+    if (platform->comm.mpiRank == 0)
+      randomize_modes(phase_next);
+    MPI_Bcast(phase_next.data(), nmode, MPI_DFLOAT, 0, platform->comm.mpiComm);
+    o_phase_next.copyFrom(phase_next.data(), nmode * sizeof(dfloat));
     last_harmonic_index = i;
   }
 
@@ -177,16 +179,17 @@ void UDF_Setup(nrs_t *nrs)
   Lz = std::abs(eposz - sposz);
   phase_current.resize(nmode, 0.0);
   phase_next.resize(nmode, 0.0);
-  randomize_modes(phase_current);
-  randomize_modes(phase_next);
+  if (platform->comm.mpiRank == 0) {
+    randomize_modes(phase_current);
+    randomize_modes(phase_next);
+  }
+  MPI_Bcast(phase_current.data(), nmode, MPI_DFLOAT, 0, platform->comm.mpiComm);
+  MPI_Bcast(phase_next.data(), nmode, MPI_DFLOAT, 0, platform->comm.mpiComm);
 
   o_phase_curr = platform->device.malloc(nmode, sizeof(dfloat));
   o_phase_next = platform->device.malloc(nmode, sizeof(dfloat));
   o_phase_curr.copyFrom(phase_current.data());
   o_phase_next.copyFrom(phase_next.data());
-  
-  FU.resize(nrs->NVfields * nrs->fieldOffset, 0.0);// For u, v, w
-  std::fill(FU.begin(), FU.end(), 0.0);
   udf.uEqnSource = &userf;
 
 }
