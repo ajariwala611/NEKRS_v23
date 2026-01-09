@@ -1,12 +1,17 @@
 //
 // nekRS User Defined File
 //
-#include <math.h>
-#include "udf.hpp"
 #include "plugins/tavg.hpp"
-#include <vector>
+#include "udf.hpp"
 #include <cmath>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <math.h>
 #include <random>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #ifdef __okl__
 #include "NACA.oudf"
@@ -15,29 +20,27 @@
 
 static dfloat U_inf;
 static dfloat AoA;
+
 static dfloat AoA_rad;
 static dfloat tdamp, rota;
-static dfloat sposx, sposy, sposz; 
+static dfloat sposx, sposy, sposz;
 static dfloat eposx, eposy, eposz;
 static dfloat smthx, smthy;
 static dfloat Lz;
 static int nmode;
 static dfloat tdt;
-
-static std::vector<double> phase_current;  // For h_i(z), size nmode
-static std::vector<double> phase_next;     // For h_{i+1}(z), size nmode
+static std::vector<double> phase_current; // For h_i(z), size nmode
+static std::vector<double> phase_next;    // For h_{i+1}(z), size nmode
 static occa::memory o_phase_curr;
 static occa::memory o_phase_next;
-
 static int last_harmonic_index = -1;
 static std::mt19937_64 rng(12345); // seed once (or seed per run)
-static std::uniform_real_distribution<double> U01(0.0, 1.0);; 
+static std::uniform_real_distribution<double> U01(0.0, 1.0);
 
-dfloat *dragvx, *dragvy, *dragvz;
-occa::memory o_dragvx, o_dragvy, o_dragvz;
-
-dfloat *dragpx, *dragpy, *dragpz;
-occa::memory o_dragpx, o_dragpy, o_dragpz;
+static dfloat *dragvx, *dragvy, *dragvz;
+static occa::memory o_dragvx, o_dragvy, o_dragvz;
+static dfloat *dragpx, *dragpy, *dragpz;
+static occa::memory o_dragpx, o_dragpy, o_dragpz;
 
 struct Force {
   dfloat x;
@@ -288,10 +291,12 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
   occa::memory o_bidWall =
       platform->device.malloc(bidWall.size() * sizeof(int), bidWall.data());
 
-  const dfloat scale = 1.0; // CD = F/(.5 rho U^2 * A) = 2*F, A=c*Lz, rho=1, U=U_inf
-  auto o_Sij = platform->device.malloc(2 * nrs->NVfields * nrs->fieldOffset, sizeof(dfloat));
+  // C = F/(.5 rho U^2 * A) = 2*F, A=c*Lz, rho=1, U=U_inf
+  const dfloat scale = 1.0;
+  auto o_Sij = platform->device.malloc(2 * nrs->NVfields * nrs->fieldOffset,
+                                       sizeof(dfloat));
   postProcessing::strainRate(nrs, true, o_Sij); // "false" is correct
-  
+
   Force dragv = compute_dragv(nrs, bidWall.size(), o_bidWall, o_Sij, scale);
   Force dragp = compute_dragp(nrs, bidWall.size(), o_bidWall, nrs->o_P, scale);
   o_Sij.free();
@@ -308,13 +313,67 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
   double Cl = F_lift / (0.5 * Lz);
 
   if (platform->comm.mpiRank == 0) {
-    printf("%d %15.8e %15.8e %15.8e %15.8e dragx(rs)\n",tstep,time,drag.x,dragp.x,dragv.x);
-    printf("%d %15.8e %15.8e %15.8e %15.8e dragy(rs)\n",tstep,time,drag.y,dragp.y,dragv.y);
-    printf("%d %15.8e %15.8e %15.8e %15.8e dragz(rs)\n",tstep,time,drag.z,dragp.z,dragv.z);
-    printf("%d %15.8e %15.8e %15.8e %15.8e %15.8e \n", tstep, time, F_drag, F_lift, Cd, Cl);
+
+    std::ofstream drag_file("drag.txt", std::ios::app);
+    std::ofstream lift_file("lift.txt", std::ios::app);
+    std::ofstream dragz_file("dragz.txt", std::ios::app);
+    std::ofstream forces_file("forces.txt", std::ios::app);
+
+    printf("%d %15.8e %15.8e %15.8e %15.8e dragx(rs)\n", tstep, time, drag.x,
+           dragp.x, dragv.x);
+    printf("%d %15.8e %15.8e %15.8e %15.8e dragy(rs)\n", tstep, time, drag.y,
+           dragp.y, dragv.y);
+    printf("%d %15.8e %15.8e %15.8e %15.8e dragz(rs)\n", tstep, time, drag.z,
+           dragp.z, dragv.z);
+    printf("%d %15.8e %15.8e %15.8e %15.8e %15.8e \n", tstep, time, F_drag,
+           F_lift, Cd, Cl);
+
+    // Set field width and precision
+    const int width_int = 6;    // for tstep
+    const int width_float = 15; // for floating point numbers
+
+    // Write drag.txt
+    if (drag_file.is_open()) {
+      drag_file << std::setw(width_int) << tstep << " "
+                << std::setw(width_float) << std::setprecision(8)
+                << std::scientific << time << " " << std::setw(width_float)
+                << drag.x << " " << std::setw(width_float) << dragp.x << " "
+                << std::setw(width_float) << dragv.x << "\n";
+      drag_file.close();
+    }
+
+    // Write lift.txt
+    if (lift_file.is_open()) {
+      lift_file << std::setw(width_int) << tstep << " "
+                << std::setw(width_float) << std::setprecision(8)
+                << std::scientific << time << " " << std::setw(width_float)
+                << drag.y << " " << std::setw(width_float) << dragp.y << " "
+                << std::setw(width_float) << dragv.y << "\n";
+      lift_file.close();
+    }
+
+    // Write dragz.txt
+    if (dragz_file.is_open()) {
+      dragz_file << std::setw(width_int) << tstep << " "
+                 << std::setw(width_float) << std::setprecision(8)
+                 << std::scientific << time << " " << std::setw(width_float)
+                 << drag.z << " " << std::setw(width_float) << dragp.z << " "
+                 << std::setw(width_float) << dragv.z << "\n";
+      dragz_file.close();
+    }
+
+    // Write forces.txt
+    if (forces_file.is_open()) {
+      forces_file << std::setw(width_int) << tstep << " "
+                  << std::setw(width_float) << std::setprecision(8)
+                  << std::scientific << time << " " << std::setw(width_float)
+                  << F_drag << " " << std::setw(width_float) << F_lift << " "
+                  << std::setw(width_float) << Cd << " "
+                  << std::setw(width_float) << Cl << "\n";
+      forces_file.close();
+    }
   }
 
-  // calling time averaging
   tavg::run(time);
 
   if (nrs->isOutputStep) {
