@@ -49,6 +49,7 @@ static occa::memory o_dragpx, o_dragpy, o_dragpz;
 
 static occa::memory o_interp_u, o_interp_v, o_interp_w;
 static occa::memory o_interp_u2, o_interp_v2, o_interp_w2;
+static occa::memory o_interp_uv, o_interp_vw, o_interp_wu;
 static pointInterpolation_t *normInterpolator = nullptr;
 static int interp_np = 0;
 static std::vector<dfloat> interp_loc_x, interp_loc_y, interp_loc_z;
@@ -111,7 +112,10 @@ void writeNormalsMonitor(const std::string &filename, dfloat time,
                          const std::vector<dfloat> &Wmean,
                          const std::vector<dfloat> &U2mean,
                          const std::vector<dfloat> &V2mean,
-                         const std::vector<dfloat> &W2mean) {
+                         const std::vector<dfloat> &W2mean,
+                         const std::vector<dfloat> &UVmean,
+                         const std::vector<dfloat> &VWmean,
+                         const std::vector<dfloat> &WUmean) {
   const int Ns = stations.size();
 
   std::ofstream out(filename,
@@ -156,6 +160,7 @@ void writeNormalsMonitor(const std::string &filename, dfloat time,
       tauw = mu * dutdn;
       utau = std::sqrt(std::abs(tauw) / rho);
     }
+    
     // Out to logfile:
     printf("time= %15.8e x/c = %5.2f: tau_w = %15.8e u_tau = %15.8e\n", time,
            stations[i], tauw, utau);
@@ -198,14 +203,38 @@ void writeNormalsMonitor(const std::string &filename, dfloat time,
       // <u'^2> = <u^2> - <u>^2
       dfloat uu_plus = 0, vv_plus = 0, ww_plus = 0;
       if (utau2 > 0) {
-        const dfloat uu = U2mean[idx] - Umean[idx]*Umean[idx];
-        const dfloat vv = V2mean[idx] - Vmean[idx]*Vmean[idx];
-        const dfloat ww = W2mean[idx] - Wmean[idx]*Wmean[idx];
-    
-        // Guard against tiny negative due to roundoff
-        uu_plus = (uu > 0 ? uu : 0) / utau2;
-        vv_plus = (vv > 0 ? vv : 0) / utau2;
-        ww_plus = (ww > 0 ? ww : 0) / utau2;
+        const dfloat Um = Umean[idx];
+        const dfloat Vm = Vmean[idx];
+        const dfloat Wm = Wmean[idx];
+
+        // Reynolds stresses in global Cartesian (fluctuating products)
+        dfloat uu = U2mean[idx] - Um*Um;
+        dfloat vv = V2mean[idx] - Vm*Vm;
+        dfloat ww = W2mean[idx] - Wm*Wm;
+
+        dfloat uv = UVmean[idx] - Um*Vm;
+        dfloat vw = VWmean[idx] - Vm*Wm;
+        dfloat wu = WUmean[idx] - Wm*Um;
+
+        // Guard tiny negatives from roundoff
+        uu = (uu > 0 ? uu : 0);
+        vv = (vv > 0 ? vv : 0);
+        ww = (ww > 0 ? ww : 0);
+
+        dfloat utt = tx*tx*uu + 2*tx*ty*uv + ty*ty*vv;  // <u_t'^2>
+        dfloat unn = nx*nx*uu + 2*nx*ny*uv + ny*ny*vv;  // <u_n'^2>
+        dfloat uww = ww;                                // <w'^2>
+
+        // Guard roundoff
+        utt = (utt > 0 ? utt : 0);
+        unn = (unn > 0 ? unn : 0);
+        uww = (uww > 0 ? uww : 0);
+
+        // Normalize to wall units
+        const dfloat utau2 = utau*utau;
+        dfloat uu_plus = (utau2 > 0) ? (utt / utau2) : 0;
+        dfloat vv_plus = (utau2 > 0) ? (unn / utau2) : 0;
+        dfloat ww_plus = (utau2 > 0) ? (uww / utau2) : 0;
       }
     
       out << std::setw(4)  << k
@@ -228,7 +257,7 @@ void writeNormalsMonitor(const std::string &filename, dfloat time,
   out.flush(); // important for live monitoring
 }
 
-void interpolateNormalPts(nrs_t *nrs, dfloat time, occa::memory o_Uavg, occa::memory o_Urms) {
+void interpolateNormalPts(nrs_t *nrs, dfloat time, occa::memory o_Uavg, occa::memory o_Urms, occa::memory o_Urm2) {
 
   // Interpolate velocity
   const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
@@ -248,6 +277,14 @@ void interpolateNormalPts(nrs_t *nrs, dfloat time, occa::memory o_Uavg, occa::me
   normInterpolator->eval(1, nrs->fieldOffset, o_mean_v2, interp_np, o_interp_v2);
   normInterpolator->eval(1, nrs->fieldOffset, o_mean_w2, interp_np, o_interp_w2);
 
+  occa::memory o_mean_uv = o_Urm2.slice(0 * fieldOffsetByte, fieldOffsetByte);
+  occa::memory o_mean_vw = o_Urm2.slice(1 * fieldOffsetByte, fieldOffsetByte);
+  occa::memory o_mean_wu = o_Urm2.slice(2 * fieldOffsetByte, fieldOffsetByte);
+
+  normInterpolator->eval(1, nrs->fieldOffset, o_mean_uv, interp_np, o_interp_uv);
+  normInterpolator->eval(1, nrs->fieldOffset, o_mean_vw, interp_np, o_interp_vw);
+  normInterpolator->eval(1, nrs->fieldOffset, o_mean_wu, interp_np, o_interp_wu);
+
   if (platform->comm.mpiRank == 0) {
     std::vector<dfloat> interp_u(interp_np), interp_v(interp_np), interp_w(interp_np);
     std::vector<dfloat> interp_u2(interp_np), interp_v2(interp_np), interp_w2(interp_np);
@@ -257,6 +294,9 @@ void interpolateNormalPts(nrs_t *nrs, dfloat time, occa::memory o_Uavg, occa::me
     o_interp_u2.copyTo(interp_u2.data());
     o_interp_v2.copyTo(interp_v2.data());
     o_interp_w2.copyTo(interp_w2.data());
+    o_interp_uv.copyTo(interp_uv.data());
+    o_interp_vw.copyTo(interp_vw.data());
+    o_interp_wu.copyTo(interp_wu.data());
     const int Ns = 10;
     const int Np = 100;
     std::vector<dfloat> stations(Ns);
@@ -266,7 +306,8 @@ void interpolateNormalPts(nrs_t *nrs, dfloat time, occa::memory o_Uavg, occa::me
     writeNormalsMonitor("normal_mean_statistic_prof.txt", time, stations, Np,
                         interp_loc_x, interp_loc_y, 
                         interp_u, interp_v, interp_w,
-                        interp_u2,interp_v2,interp_w2);
+                        interp_u2,interp_v2,interp_w2,
+                        interp_uv,interp_vw,interp_wu);
   }
 }
 
@@ -274,6 +315,7 @@ void compute_dump_stats(nrs_t *nrs, dfloat time) {
   static bool initialized = false;
   static occa::memory o_Uavg;
   static occa::memory o_Urms;
+  static occa::memory o_Urm2;
   static dfloat last_dump_time;
 
   if (!initialized) {
@@ -287,6 +329,9 @@ void compute_dump_stats(nrs_t *nrs, dfloat time) {
       o_interp_u2 = platform->device.malloc(interp_np, sizeof(dfloat));
       o_interp_v2 = platform->device.malloc(interp_np, sizeof(dfloat));
       o_interp_w2 = platform->device.malloc(interp_np, sizeof(dfloat));
+      o_interp_uv = platform->device.malloc(interp_np, sizeof(dfloat));
+      o_interp_vw = platform->device.malloc(interp_np, sizeof(dfloat));
+      o_interp_wu = platform->device.malloc(interp_np, sizeof(dfloat));
       normInterpolator = new pointInterpolation_t(nrs);
       normInterpolator->setPoints(interp_np, interp_loc_x.data(),
                                   interp_loc_y.data(), interp_loc_z.data());
@@ -298,7 +343,8 @@ void compute_dump_stats(nrs_t *nrs, dfloat time) {
   if (time >= last_dump_time) {
     o_Uavg = tavg::get_o_Uavg();
     o_Urms = tavg::get_o_Urms();
-    interpolateNormalPts(nrs, time, o_Uavg, o_Urms);
+    o_Urm2 = tavg::get_o_Urm2();
+    interpolateNormalPts(nrs, time, o_Uavg, o_Urms, o_Urm2);
     last_dump_time += stat_dump_freq;
   }
 }
