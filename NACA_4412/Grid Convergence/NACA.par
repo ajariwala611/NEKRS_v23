@@ -1,0 +1,69 @@
+#
+# nek parameter file
+#
+[OCCA]
+backend = CUDA
+deviceNumber = LOCAL-RANK
+
+[GENERAL]
+#verbose = true
+# startFrom = "NACA0.restart+time=0.0"
+# startFrom = "NACA0.restart+time=0.0+int"
+startFrom = "NACA0.f00021"
+polynomialOrder = 7
+subCyclingSteps = 4
+stopAt = endTime
+endTime = 10
+
+dt = targetCFL=2 + max=1e-4 + initial=1e-5
+# dt = targetCFL=3.0 + max=5e-5
+timeStepper = tombo2
+
+writeControl = simulationTime 
+writeInterval = 0.1
+
+regularization = hpfrt + nModes=1 + scalingCoeff=10
+
+[MESH]
+writeToFieldFile = true
+connectivityTol = 0.1
+
+[PRESSURE]
+residualTol = 1e-04
+initialGuess = projectionAconj+nVector=30
+
+[VELOCITY]
+boundaryTypeMap = codedFixedValue,fixedGradient,zeroValue,codedFixedValue,fixedGradient,none,none
+viscosity = 1/400000
+density = 1.0
+residualTol = 1e-06
+
+[SCALAR00] #Qcriterion
+solver = none
+
+[SCALAR01] # <U>
+solver = none
+
+[SCALAR02] # <V>
+solver = none
+
+[SCALAR03] # Tripping Forces
+solver = none
+
+[CASEDATA]
+U_inf = 1.0    # Freestream velocity.
+AoA = 11.0     # Angle of attack in degrees.
+TDAMP = 5.0         # Time dependent amplitude
+SPOSX = 0.0197        # Starting pont X
+SPOSY = 0.0302         # Starting pont Y
+SPOSZ = 0.0        # Starting pont Z
+EPOSX = 0.0197         # Ending pont X
+EPOSY = 0.0302       # Ending pont Y
+EPOSZ = 0.1        # Ending pont Z
+SMTHX = 0.005        # Smoothing length X
+SMTHY = 0.001        # Smoothing length Y
+ROTA  = 0.625        # Rotation angle in radians
+NMODE = 64		              # Number of Fourier modes
+TDT = 0.005	      # Time step for tripping
+avg_time = 0.0      # time after which averaging start in absolute units
+stat_dump_freq = 0.1 # dump stat every t sim time

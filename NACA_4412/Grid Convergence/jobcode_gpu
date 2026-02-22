@@ -1,0 +1,20 @@
+#!/bin/bash
+#SBATCH -J trplR400
+#SBATCH -o logfile 
+#SBATCH -e errfile
+#SBATCH -p h100
+#SBATCH -N 4
+#SBATCH -n 16
+#SBATCH --ntasks-per-node 4
+#SBATCH -t 5:00:00
+
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+export OCCA_CUDA_COMPILER="$CUDA_HOME/bin/nvcc"
+
+# Quick sanity check
+echo "CUDA_HOME=$CUDA_HOME"
+which nvcc && nvcc --version
+
+ibrun nekrs --setup NACA.par --backend CUDA
