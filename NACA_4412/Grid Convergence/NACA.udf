@@ -288,6 +288,7 @@ void interpolateNormalPts(nrs_t *nrs, dfloat time, occa::memory o_Uavg, occa::me
   if (platform->comm.mpiRank == 0) {
     std::vector<dfloat> interp_u(interp_np), interp_v(interp_np), interp_w(interp_np);
     std::vector<dfloat> interp_u2(interp_np), interp_v2(interp_np), interp_w2(interp_np);
+    std::vector<dfloat> interp_uv(interp_np), interp_vw(interp_np), interp_wu(interp_np);
     o_interp_u.copyTo(interp_u.data());
     o_interp_v.copyTo(interp_v.data());
     o_interp_w.copyTo(interp_w.data());
