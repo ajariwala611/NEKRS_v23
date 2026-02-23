@@ -162,7 +162,7 @@ void writeNormalsMonitor(const std::string &filename, dfloat time,
     }
     
     // Out to logfile:
-    printf("time= %15.8e x/c = %5.2f: tau_w = %15.8e u_tau = %15.8e\n", time,
+    printf("time = %15.8e x/c = %5.2f: tau_w = %15.8e u_tau = %15.8e\n", time,
            stations[i], tauw, utau);
     // ===== Station Header =====
     out << "\n================================================================="
@@ -182,8 +182,6 @@ void writeNormalsMonitor(const std::string &filename, dfloat time,
     out << "-------------------------------------------------------------------"
            "-------------\n";
 
-    const dfloat utau2 = utau * utau;
-
     // ===== Write Np rows =====
     for (int k = 0; k < Np; ++k) {
       const std::size_t idx = base + k;
@@ -202,6 +200,8 @@ void writeNormalsMonitor(const std::string &filename, dfloat time,
       // Reynolds normal stresses (variance) in + units:
       // <u'^2> = <u^2> - <u>^2
       dfloat uu_plus = 0, vv_plus = 0, ww_plus = 0;
+      const dfloat utau2 = utau * utau;
+
       if (utau2 > 0) {
         const dfloat Um = Umean[idx];
         const dfloat Vm = Vmean[idx];
@@ -213,14 +213,16 @@ void writeNormalsMonitor(const std::string &filename, dfloat time,
         dfloat ww = W2mean[idx] - Wm*Wm;
 
         dfloat uv = UVmean[idx] - Um*Vm;
-        dfloat vw = VWmean[idx] - Vm*Wm;
-        dfloat wu = WUmean[idx] - Wm*Um;
+        // vw, wu not used for utt/unn if your local basis is in x-y and w is global z
+        // dfloat vw = VWmean[idx] - Vm*Wm;
+        // dfloat wu = WUmean[idx] - Wm*Um;
 
         // Guard tiny negatives from roundoff
         uu = (uu > 0 ? uu : 0);
         vv = (vv > 0 ? vv : 0);
         ww = (ww > 0 ? ww : 0);
 
+        // Rotate to local (t,n) in x-y plane
         dfloat utt = tx*tx*uu + 2*tx*ty*uv + ty*ty*vv;  // <u_t'^2>
         dfloat unn = nx*nx*uu + 2*nx*ny*uv + ny*ny*vv;  // <u_n'^2>
         dfloat uww = ww;                                // <w'^2>
@@ -231,10 +233,9 @@ void writeNormalsMonitor(const std::string &filename, dfloat time,
         uww = (uww > 0 ? uww : 0);
 
         // Normalize to wall units
-        const dfloat utau2 = utau*utau;
-        dfloat uu_plus = (utau2 > 0) ? (utt / utau2) : 0;
-        dfloat vv_plus = (utau2 > 0) ? (unn / utau2) : 0;
-        dfloat ww_plus = (utau2 > 0) ? (uww / utau2) : 0;
+        uu_plus = utt / utau2;
+        vv_plus = unn / utau2;
+        ww_plus = uww / utau2;
       }
     
       out << std::setw(4)  << k
