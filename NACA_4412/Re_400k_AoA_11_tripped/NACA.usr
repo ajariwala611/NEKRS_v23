@@ -1,0 +1,212 @@
+!-----------------------------------------------------------------------
+!  nek5000 user-file template
+!
+!  user specified routines:
+!     - uservp  : variable properties
+!     - userf   : local acceleration term for fluid
+!     - userq   : local source term for scalars
+!     - userbc  : boundary conditions
+!     - useric  : initial conditions
+!     - userchk : general purpose routine for checking errors etc.
+!     - userqtl : thermal divergence for lowMach number flows 
+!     - usrdat  : modify element vertices 
+!     - usrdat2 : modify mesh coordinates
+!     - usrdat3 : general purpose routine for initialization
+!     
+!-----------------------------------------------------------------------
+!-----------------------------------------------------------------------
+      subroutine uservp(ix,iy,iz,eg) ! set variable properties
+
+!      implicit none
+
+      integer ix,iy,iz,eg
+     
+      include 'SIZE'
+      include 'TOTAL'
+      include 'NEKUSE'
+
+      integer e
+!     e = gllel(eg)
+
+      udiff  = 0.0
+      utrans = 0.0
+
+      return
+      end
+!-----------------------------------------------------------------------
+      subroutine userf(ix,iy,iz,eg) ! set acceleration term
+!
+!         Note: this is an acceleration term, NOT a force!
+!         Thus, ffx will subsequently be multiplied by rho(x,t).
+!
+!         Note: This function will be used to implemend immersed boundary forces.
+!         Assumes constant rho = 1
+!
+!         Modified by Alex Tsolovikos on 2022-01-12
+!
+          implicit none
+
+          integer ix,iy,iz,eg
+          real pgain, igain
+
+          include 'SIZE'
+          include 'TOTAL'
+          include 'NEKUSE'
+
+          integer e
+          e = gllel(eg)
+
+
+          ffx = 0.0
+          ffy = 0.0
+          ffz = 0.0
+
+          return
+      end
+!-----------------------------------------------------------------------
+      subroutine userq(ix,iy,iz,eg) ! set source term
+
+!          implicit none
+
+          integer ix,iy,iz,eg
+
+          include 'SIZE'
+          include 'TOTAL'
+          include 'NEKUSE'
+
+          integer e
+!         e = gllel(eg)
+
+          qvol   = 0.0
+
+          return
+      end
+!-----------------------------------------------------------------------
+      subroutine userbc(ix,iy,iz,iside,eg) ! set up boundary conditions
+          return
+      end
+!-----------------------------------------------------------------------
+      subroutine useric(ix,iy,iz,eg) ! set up initial conditions
+!
+      end
+!-----------------------------------------------------------------------
+      subroutine userchk
+          include 'SIZE'
+          include 'TOTAL'
+
+      !     Forces
+      !     real scle
+      !     real x0(3)
+      !     save x0
+      !     data x0 /3*0/
+
+      !     if (istep.eq.0) call set_obj  ! define objects for surface integrals
+      !     scle = 1.0  ! Cd = F/(.5 rho U^2 ) = 2*F, output drag and lift if scale=1 if = 2 then its Cd and Cl
+      !     call torque_calc(scle,x0,.true.,.false.)
+
+          return
+      end
+!-----------------------------------------------------------------------
+      subroutine userqtl ! Set thermal divergence
+
+      call userqtl_scig 
+
+      return
+      end
+!-----------------------------------------------------------------------
+      subroutine usrdat()   ! This routine to modify element vertices
+
+!      implicit none
+
+      include 'SIZE'
+      include 'TOTAL'
+
+       integer n
+       real ymin, ymax
+       real           xstart, U_inf
+       COMMON /CASEDATA/ xstart, U_inf  
+ 
+
+      return
+      end
+!-----------------------------------------------------------------------
+      subroutine usrdat2()  ! This routine to modify mesh coordinates
+
+!         implicit none
+
+          include 'SIZE'
+          include 'TOTAL'
+
+          ! reconstruct boundary tags 
+
+          return
+      end
+!-----------------------------------------------------------------------
+      subroutine usrdat3()
+
+          implicit none
+
+          include 'SIZE'
+          include 'TOTAL'
+
+          return
+      end
+!-----------------------------------------------------------------------
+      subroutine usrdat0()
+        include 'SIZE'
+        include 'TOTAL'
+  
+        real           xstart, U_inf
+        COMMON /CASEDATA/ xstart, U_inf
+  
+        COMMON /NRSSCPTR/ nrs_scptr(3)
+        integer*8         nrs_scptr
+  
+        nrs_scptr(1) = loc(xstart)
+        nrs_scptr(2) = loc(U_inf)
+  
+        return
+        end
+!-----------------------------------------------------------------------
+      subroutine set_obj  ! define objects for surface integrals
+
+            include 'SIZE'
+            include 'TOTAL'
+
+            integer e,f,eg
+
+            nobj = 1
+            iobj = 0
+            do ii=nhis+1,nhis+nobj
+            iobj = iobj+1
+            hcode(10,ii) = 'I'
+            hcode( 1,ii) = 'F'
+            hcode( 2,ii) = 'F'
+            hcode( 3,ii) = 'F'
+            lochis(1,ii) = iobj
+            enddo
+            nhis = nhis + nobj
+
+            if (maxobj.lt.nobj) call exitti('increase maxobj in SIZE$',nobj)
+
+            nxyz  = nx1*ny1*nz1
+            nface = 2*ndim
+
+            do e=1,nelv
+            do f=1,nface
+            if (boundaryID(f,e) .eq. 3) then
+                  iobj  = 1
+                  if (iobj.gt.0) then
+                        nmember(iobj) = nmember(iobj) + 1
+                        mem = nmember(iobj)
+                        eg  = lglel(e)
+                        object(iobj,mem,1) = eg
+                        object(iobj,mem,2) = f
+                  endif
+            endif
+            enddo
+            enddo
+
+      return
+      end
+!-------------------------------------------
