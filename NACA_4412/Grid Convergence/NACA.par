@@ -65,5 +65,6 @@ SMTHY = 0.001        # Smoothing length Y
 ROTA  = 0.625        # Rotation angle in radians
 NMODE = 64		              # Number of Fourier modes
 TDT = 0.005	      # Time step for tripping
+Nz = 10             # number of station in spanwise direction for span Avg.
 avg_time = 0.0      # time after which averaging start in absolute units
 stat_dump_freq = 0.1 # dump stat every t sim time

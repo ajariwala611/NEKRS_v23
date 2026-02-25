@@ -34,6 +34,8 @@ static dfloat tdt;
 
 static dfloat avg_time;
 static dfloat stat_dump_freq;
+static int Nz;
+
 static std::vector<double> phase_current; // For h_i(z), size nmode
 static std::vector<double> phase_next;    // For h_{i+1}(z), size nmode
 static occa::memory o_phase_curr;
@@ -54,47 +56,77 @@ static pointInterpolation_t *normInterpolator = nullptr;
 static int interp_np = 0;
 static std::vector<dfloat> interp_loc_x, interp_loc_y, interp_loc_z;
 
-// Reads x, y, z coordinates from file and fills vectors
-void readGridFile(const std::string &filename, std::vector<dfloat> &x,
-                  std::vector<dfloat> &y, std::vector<dfloat> &z, int mpiRank) {
+
+// Reads x,y from file and replicates points across Nz planes to fill x,y,z.
+void readGridFileMultiZ(const std::string &filename,
+                        std::vector<dfloat> &x,
+                        std::vector<dfloat> &y,
+                        std::vector<dfloat> &z,
+                        int mpiRank,
+                        int Nz,
+                        dfloat Lz)
+{
   x.clear();
   y.clear();
   z.clear();
 
   if (mpiRank != 0) {
-    // Non-root ranks: do nothing, vectors remain empty
+    // Non-root ranks: do nothing
     return;
   }
 
-  // Only rank 0 executes this part:
+  if (Nz <= 0) {
+    std::cerr << "readGridFileMultiZ: Nz must be > 0\n";
+    return;
+  }
+
   std::ifstream infile(filename);
   if (!infile.is_open()) {
     std::cerr << "Error opening file: " << filename << std::endl;
     return;
   }
 
-  std::string line;
-  int np = 0;
-
-  // Read number of points
-  if (std::getline(infile, line)) {
-    std::istringstream iss(line);
-    iss >> np;
+  // Build z-planes: midpoint rule avoids sampling exactly at periodic boundaries
+  std::vector<dfloat> zlist(Nz);
+  for (int j = 0; j < Nz; ++j) {
+    zlist[j] = ( (dfloat)j + 0.5 ) * (Lz / (dfloat)Nz);
   }
 
-  x.reserve(np);
-  y.reserve(np);
-  z.reserve(np);
+  std::string line;
+  int np_xy = 0;
 
-  // Read coordinates
+  // Read number of (x,y) points (first line)
+  if (std::getline(infile, line)) {
+    std::istringstream iss(line);
+    iss >> np_xy;
+  }
+
+  // Reserve total points replicated across Nz planes
+  const std::size_t np_total = (std::size_t)np_xy * (std::size_t)Nz;
+  x.reserve(np_total);
+  y.reserve(np_total);
+  z.reserve(np_total);
+
+  // Read x,y and replicate over zlist
+  int count_xy = 0;
   while (std::getline(infile, line)) {
     std::istringstream iss(line);
     dfloat xi, yi;
     if (iss >> xi >> yi) {
-      x.push_back(xi);
-      y.push_back(yi);
-      z.push_back(eposz / 2.0);
+      ++count_xy;
+
+      for (int j = 0; j < Nz; ++j) {
+        x.push_back(xi);
+        y.push_back(yi);
+        z.push_back(zlist[j]);
+      }
     }
+  }
+
+  // Optional sanity warning if file count doesn't match header
+  if (np_xy > 0 && count_xy != np_xy) {
+    std::cerr << "readGridFileMultiZ warning: header np=" << np_xy
+              << " but read " << count_xy << " (x,y) points\n";
   }
 }
 
@@ -104,7 +136,7 @@ static inline dfloat safeSqrt(dfloat x) {
 }
 
 void writeNormalsMonitor(const std::string &filename, dfloat time,
-                         const std::vector<dfloat> &stations, int Np,
+                         const std::vector<dfloat> &stations, int Np, int Nz,
                          const std::vector<dfloat> &x,
                          const std::vector<dfloat> &y,
                          const std::vector<dfloat> &Umean,
@@ -115,133 +147,158 @@ void writeNormalsMonitor(const std::string &filename, dfloat time,
                          const std::vector<dfloat> &W2mean,
                          const std::vector<dfloat> &UVmean,
                          const std::vector<dfloat> &VWmean,
-                         const std::vector<dfloat> &WUmean) {
-  const int Ns = stations.size();
+                         const std::vector<dfloat> &WUmean)
+{
+  const int Ns = (int)stations.size();
+  const int NpTot = Np * Nz;
 
-  std::ofstream out(filename,
-                    std::ios::out | std::ios::trunc); // Rewrite the file
+  std::ofstream out(filename, std::ios::out | std::ios::trunc);
   out << std::scientific << std::setprecision(6);
+
+  const dfloat invNz = 1.0 / (dfloat)Nz;
 
   for (int i = 0; i < Ns; ++i) {
 
-    const std::size_t base = static_cast<std::size_t>(i) * Np;
+    // base offset for this station in the 3D (Np*Nz) arrays
+    const std::size_t base3 = (std::size_t)i * (std::size_t)NpTot;
 
-    // Estimate normal from first two points
-    dfloat nx = x[base + 1] - x[base + 0];
-    dfloat ny = y[base + 1] - y[base + 0];
-    dfloat nrm = std::sqrt(nx * nx + ny * ny);
-    nx /= nrm;
-    ny /= nrm;
+    // helper: pointer to first z-sample for (i,k)
+    auto pbase = [&](int k) -> std::size_t {
+      return base3 + (std::size_t)k * (std::size_t)Nz;
+    };
+
+    // helper: span-average any field at (i,k)
+    auto zavg = [&](const std::vector<dfloat> &a, int k) -> dfloat {
+      const std::size_t b = pbase(k);
+      dfloat s = 0;
+      for (int j = 0; j < Nz; ++j) s += a[b + (std::size_t)j];
+      return s * invNz;
+    };
+
+    // x,y are replicated across z; just take j=0 for geometry
+    auto xk = [&](int k) -> dfloat { return x[pbase(k)]; };
+    auto yk = [&](int k) -> dfloat { return y[pbase(k)]; };
+
+    // Estimate normal from first two points (geometry only)
+    dfloat nx = xk(1) - xk(0);
+    dfloat ny = yk(1) - yk(0);
+    dfloat nrm = std::sqrt(nx*nx + ny*ny);
+    nx /= nrm; ny /= nrm;
 
     dfloat tx = -ny;
-    dfloat ty = nx;
-    if (tx < 0) {
-      tx = -tx;
-      ty = -ty;
-    };
+    dfloat ty =  nx;
+    if (tx < 0) { tx = -tx; ty = -ty; } // keep chordwise-ish sign convention
 
     auto ydist = [&](int k) {
-      return (x[base + k] - x[base + 0]) * nx +
-             (y[base + k] - y[base + 0]) * ny;
+      return (xk(k) - xk(0))*nx + (yk(k) - yk(0))*ny;
     };
 
+    // ---- compute tau_w from span-averaged mean profile ----
     const dfloat y1 = ydist(1);
     const dfloat y2 = ydist(2);
 
-    const dfloat ut1 = Umean[base + 1] * tx + Vmean[base + 1] * ty; // point 1
-    const dfloat ut2 = Umean[base + 2] * tx + Vmean[base + 2] * ty; // point 2
+    const dfloat Um1 = zavg(Umean, 1);
+    const dfloat Vm1 = zavg(Vmean, 1);
+    const dfloat Um2 = zavg(Umean, 2);
+    const dfloat Vm2 = zavg(Vmean, 2);
+
+    const dfloat ut1 = Um1*tx + Vm1*ty;
+    const dfloat ut2 = Um2*tx + Vm2*ty;
 
     dfloat tauw = 0.0, utau = 0.0;
-
     if (y1 > 0 && y2 > y1) {
       const dfloat b = y2 / (y1 * (y2 - y1));
       const dfloat c = -y1 / (y2 * (y2 - y1));
-      const dfloat dutdn = b * ut1 + c * ut2;
+      const dfloat dutdn = b*ut1 + c*ut2;  // u0=0 enforced implicitly
       tauw = mu * dutdn;
       utau = std::sqrt(std::abs(tauw) / rho);
     }
-    
-    // Out to logfile:
-    printf("time = %15.8e x/c = %5.2f: tau_w = %15.8e u_tau = %15.8e\n", time,
-           stations[i], tauw, utau);
-    // ===== Station Header =====
-    out << "\n================================================================="
-           "===============\n";
+
+    printf("time = %15.8e x/c = %5.2f: tau_w = %15.8e u_tau = %15.8e\n",
+           time, stations[i], tauw, utau);
+
+    // ----- headers -----
+    out << "\n==================================================================\n";
     out << "# time = " << time << "\n";
     out << "# x/c = " << stations[i] << "   tau_w = " << tauw
         << "   u_tau = " << utau << "\n";
-    out << "==================================================================="
-           "=============\n";
+    out << "==================================================================\n";
 
-    out << std::setw(4) << "k" << std::setw(15) << "y" << std::setw(15)
-        << "Umean" << std::setw(15) << "Vmean" << std::setw(15) << "ut" << std::setw(15) << "vn"
-        << std::setw(15) << "y+" << std::setw(15) << "U+" << std::setw(15) << "V+" << std::setw(15) << "W+"
-        << std::setw(15) << "uu+" << std::setw(15) << "vv+" << std::setw(15) << "ww+"
+    out << std::setw(4)  << "k"
+        << std::setw(15) << "y"
+        << std::setw(15) << "Umean"
+        << std::setw(15) << "Vmean"
+        << std::setw(15) << "ut"
+        << std::setw(15) << "vn"
+        << std::setw(15) << "y+"
+        << std::setw(15) << "U+"
+        << std::setw(15) << "V+"
+        << std::setw(15) << "W+"
+        << std::setw(15) << "uu+"
+        << std::setw(15) << "vv+"
+        << std::setw(15) << "ww+"
         << "\n";
 
-    out << "-------------------------------------------------------------------"
-           "-------------\n";
+    out << "-------------------------------------------------------------------\n";
 
-    // ===== Write Np rows =====
+    // ----- rows (still Np rows) -----
+    const dfloat utau2 = utau * utau;
+
     for (int k = 0; k < Np; ++k) {
-      const std::size_t idx = base + k;
-    
-      // Mean projections
-      const dfloat ut = Umean[idx]*tx + Vmean[idx]*ty;   // tangential mean
-      const dfloat un = Umean[idx]*nx + Vmean[idx]*ny;   // wall-normal mean (2D normal)
-      const dfloat yk = std::max<dfloat>(ydist(k), 0);
-    
-      // Wall units
-      const dfloat yplus  = (utau > 0) ? (utau * yk / nu) : 0;
+
+      // span-averaged means at this (i,k)
+      const dfloat Um = zavg(Umean, k);
+      const dfloat Vm = zavg(Vmean, k);
+      const dfloat Wm = zavg(Wmean, k);
+
+      // projections
+      const dfloat ut = Um*tx + Vm*ty;
+      const dfloat un = Um*nx + Vm*ny;
+
+      const dfloat ydist_k = std::max<dfloat>(ydist(k), 0);
+
+      // wall units
+      const dfloat yplus   = (utau > 0) ? (utau * ydist_k / nu) : 0;
       const dfloat ut_plus = (utau > 0) ? (ut / utau) : 0;
       const dfloat un_plus = (utau > 0) ? (un / utau) : 0;
-      const dfloat w_plus  = (utau > 0) ? (Wmean[idx] / utau) : 0;
-    
-      // Reynolds normal stresses (variance) in + units:
-      // <u'^2> = <u^2> - <u>^2
-      dfloat uu_plus = 0, vv_plus = 0, ww_plus = 0;
-      const dfloat utau2 = utau * utau;
+      const dfloat w_plus  = (utau > 0) ? (Wm / utau) : 0;
 
-      if (utau2 > 0) {
-        const dfloat Um = Umean[idx];
-        const dfloat Vm = Vmean[idx];
-        const dfloat Wm = Wmean[idx];
+      // span-averaged second moments/cross moments
+      const dfloat U2m = zavg(U2mean, k);
+      const dfloat V2m = zavg(V2mean, k);
+      const dfloat W2m = zavg(W2mean, k);
+      const dfloat UVm = zavg(UVmean, k);
+      // VWm/WUm not used for (t,n) in x-y plane; keep if you later rotate fully 3D
+      // const dfloat VWm = zavg(VWmean, k);
+      // const dfloat WUm = zavg(WUmean, k);
 
-        // Reynolds stresses in global Cartesian (fluctuating products)
-        dfloat uu = U2mean[idx] - Um*Um;
-        dfloat vv = V2mean[idx] - Vm*Vm;
-        dfloat ww = W2mean[idx] - Wm*Wm;
+      // Reynolds stresses in global Cartesian (fluctuating products)
+      dfloat uu = U2m - Um*Um;
+      dfloat vv = V2m - Vm*Vm;
+      dfloat ww = W2m - Wm*Wm;
+      dfloat uv = UVm - Um*Vm;
 
-        dfloat uv = UVmean[idx] - Um*Vm;
-        // vw, wu not used for utt/unn if your local basis is in x-y and w is global z
-        // dfloat vw = VWmean[idx] - Vm*Wm;
-        // dfloat wu = WUmean[idx] - Wm*Um;
+      uu = (uu > 0 ? uu : 0);
+      vv = (vv > 0 ? vv : 0);
+      ww = (ww > 0 ? ww : 0);
 
-        // Guard tiny negatives from roundoff
-        uu = (uu > 0 ? uu : 0);
-        vv = (vv > 0 ? vv : 0);
-        ww = (ww > 0 ? ww : 0);
+      // rotate to local (t,n) in x-y plane
+      dfloat utt = tx*tx*uu + 2*tx*ty*uv + ty*ty*vv; // <u_t'^2>
+      dfloat unn = nx*nx*uu + 2*nx*ny*uv + ny*ny*vv; // <u_n'^2>
+      dfloat uww = ww;                               // <w'^2>
 
-        // Rotate to local (t,n) in x-y plane
-        dfloat utt = tx*tx*uu + 2*tx*ty*uv + ty*ty*vv;  // <u_t'^2>
-        dfloat unn = nx*nx*uu + 2*nx*ny*uv + ny*ny*vv;  // <u_n'^2>
-        dfloat uww = ww;                                // <w'^2>
+      utt = (utt > 0 ? utt : 0);
+      unn = (unn > 0 ? unn : 0);
+      uww = (uww > 0 ? uww : 0);
 
-        // Guard roundoff
-        utt = (utt > 0 ? utt : 0);
-        unn = (unn > 0 ? unn : 0);
-        uww = (uww > 0 ? uww : 0);
+      const dfloat uu_plus = (utau2 > 0) ? (utt / utau2) : 0;
+      const dfloat vv_plus = (utau2 > 0) ? (unn / utau2) : 0;
+      const dfloat ww_plus = (utau2 > 0) ? (uww / utau2) : 0;
 
-        // Normalize to wall units
-        uu_plus = utt / utau2;
-        vv_plus = unn / utau2;
-        ww_plus = uww / utau2;
-      }
-    
       out << std::setw(4)  << k
-          << std::setw(15) << yk
-          << std::setw(15) << Umean[idx]
-          << std::setw(15) << Vmean[idx]
+          << std::setw(15) << ydist_k
+          << std::setw(15) << Um
+          << std::setw(15) << Vm
           << std::setw(15) << ut
           << std::setw(15) << un
           << std::setw(15) << yplus
@@ -255,7 +312,7 @@ void writeNormalsMonitor(const std::string &filename, dfloat time,
     }
   }
 
-  out.flush(); // important for live monitoring
+  out.flush();
 }
 
 void interpolateNormalPts(nrs_t *nrs, dfloat time, occa::memory o_Uavg, occa::memory o_Urms, occa::memory o_Urm2) {
@@ -305,7 +362,7 @@ void interpolateNormalPts(nrs_t *nrs, dfloat time, occa::memory o_Uavg, occa::me
     for (int i = 0; i < Ns; ++i)
       stations[i] = 0.1 + (1.0 - 0.1) * (dfloat)i / (dfloat)(Ns - 1);
 
-    writeNormalsMonitor("normal_mean_statistic_prof.txt", time, stations, Np,
+    writeNormalsMonitor("normal_mean_statistic_prof.txt", time, stations, Np, Nz,
                         interp_loc_x, interp_loc_y, 
                         interp_u, interp_v, interp_w,
                         interp_u2,interp_v2,interp_w2,
@@ -322,8 +379,8 @@ void compute_dump_stats(nrs_t *nrs, dfloat time) {
 
   if (!initialized) {
     if (!normInterpolator) {
-      readGridFile("NACA4412_normals_ravel.txt", interp_loc_x, interp_loc_y,
-                   interp_loc_z, platform->comm.mpiRank);
+      readGridFileMultiZ("NACA4412_normals_ravel.txt", interp_loc_x, interp_loc_y,
+                   interp_loc_z, platform->comm.mpiRank, Nz, Lz);
       interp_np = interp_loc_x.size();
       o_interp_u = platform->device.malloc(interp_np, sizeof(dfloat));
       o_interp_v = platform->device.malloc(interp_np, sizeof(dfloat));
@@ -535,6 +592,7 @@ void UDF_Setup0(MPI_Comm comm, setupAide &options) {
 
   platform->par->extract("casedata", "avg_time", avg_time);
   platform->par->extract("casedata", "stat_dump_freq", stat_dump_freq);
+  platform->par->extract("casedata", "Nz", Nz);
 
   *((double *)nek::scPtr(1)) = U_inf;
   *((double *)nek::scPtr(2)) = AoA;
