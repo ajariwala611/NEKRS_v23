@@ -29,11 +29,13 @@ static dfloat smthx, smthy;
 static dfloat Lz;
 static int nmode;
 static dfloat tdt;
+static int trip_steps;
+static dfloat dt_LES;
 static std::vector<double> phase_current; // For h_i(z), size nmode
 static std::vector<double> phase_next;    // For h_{i+1}(z), size nmode
 static occa::memory o_phase_curr;
 static occa::memory o_phase_next;
-static int last_harmonic_index = -1;
+static int last_harmonic_index = 0;
 static std::mt19937_64 rng(12345); // seed once (or seed per run)
 static std::uniform_real_distribution<double> U01(0.0, 1.0);
 
@@ -182,13 +184,17 @@ void generate_tripping_forces(nrs_t *nrs, dfloat time, occa::memory o_FU) {
   const double invLz = 1.0 / Lz;
 
   // time blending
-  const int i = (int)std::floor(time / t_s);
-  const double p = (time / t_s) - i;
-  const double bt = (3.0 - 2.0 * p) * p * p; // 3p^2 - 2p^3
+  const auto tstep = nrs->tstep;
+  const int m = trip_steps; // e.g., round(ts / dt_ref)
+  const int i = tstep / m;
+  const int k = tstep % m;
+  const dfloat p = (dfloat)k / (dfloat)m;
+  const dfloat bt = (3.0 - 2.0 * p) * p * p; // 3p^2 - 2p^3
 
   if (i != last_harmonic_index) {
     // phase_current <- phase_next (device-to-device copy)
     o_phase_curr.copyFrom(o_phase_next, nmode * sizeof(dfloat));
+    // o_phase_curr.copyTo(phase_current.data(), nmode * sizeof(dfloat));
     // phase_next <- new random (host -> device)
     if (platform->comm.mpiRank == 0)
       randomize_modes(phase_next);
@@ -204,8 +210,8 @@ void generate_tripping_forces(nrs_t *nrs, dfloat time, occa::memory o_FU) {
   if (nrs->isOutputStep) {
     const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
     auto o_FUy = nrs->o_FU.slice(1 * fieldOffsetByte, fieldOffsetByte);
-    auto o_S1 = nrs->cds->o_S.slice(1 * fieldOffsetByte, fieldOffsetByte);
-    o_S1.copyFrom(o_FUy);
+    auto o_S3 = nrs->cds->o_S.slice(3 * fieldOffsetByte, fieldOffsetByte);
+    o_S3.copyFrom(o_FUy);
   }
 }
 
@@ -428,8 +434,8 @@ void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep) {
 
   if (!initialized) {
     const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
-    o_mean_vx = nrs->cds->o_S.slice(2 * fieldOffsetByte, fieldOffsetByte);
-    o_mean_vy = nrs->cds->o_S.slice(3 * fieldOffsetByte, fieldOffsetByte);
+    o_mean_vx = nrs->cds->o_S.slice(1 * fieldOffsetByte, fieldOffsetByte);
+    o_mean_vy = nrs->cds->o_S.slice(2 * fieldOffsetByte, fieldOffsetByte);
     mpc_time_delay += time; // first allowed MPC update
     last_mpc_update_time = mpc_time_delay;
     u_optimal.assign(mpc_time_horizon, 0.0);
@@ -441,7 +447,7 @@ void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep) {
     if (platform->comm.mpiRank == 0) {
       std::ofstream fout("jet_input.txt", std::ios::app);
       // First three columns: width 6, default notation
-      fout << std::setw(6) << tstep << " ";
+      fout << std::setw(8) << tstep << " ";
       fout << std::setw(6) << std::setprecision(4) << std::scientific << time
            << " ";
       fout << std::setw(6) << std::setprecision(4) << jet_input << std::endl;
@@ -464,11 +470,11 @@ void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep) {
 
   jet_input = u_optimal[ctrl_idx];
   if (platform->comm.mpiRank == 0) {
-    printf("%d %15.8e ctrl_idx: %d u_optimal: %15.8e jet_input: %15.8e \n", tstep, time, ctrl_idx,
-      u_optimal[ctrl_idx], jet_input);
+    printf("%d %15.8e ctrl_idx: %d u_optimal: %15.8e jet_input: %15.8e \n",
+           tstep, time, ctrl_idx, u_optimal[ctrl_idx], jet_input);
     std::ofstream fout("jet_input.txt", std::ios::app);
     // First three columns: width 6, default notation
-    fout << std::setw(6) << tstep << " ";
+    fout << std::setw(8) << tstep << " ";
     fout << std::setw(6) << std::setprecision(4) << std::scientific << time
          << " ";
     fout << std::setw(6) << std::setprecision(4) << jet_input << std::endl;
@@ -519,6 +525,8 @@ void UDF_Setup0(MPI_Comm comm, setupAide &options) {
 
   *((double *)nek::scPtr(1)) = U_inf;
   *((double *)nek::scPtr(2)) = AoA;
+
+  platform->options.getArgs("DT", dt_LES);
 }
 
 void UDF_Setup(nrs_t *nrs) {
@@ -542,14 +550,17 @@ void UDF_Setup(nrs_t *nrs) {
   MPI_Bcast(phase_current.data(), nmode, MPI_DFLOAT, 0, platform->comm.mpiComm);
   MPI_Bcast(phase_next.data(), nmode, MPI_DFLOAT, 0, platform->comm.mpiComm);
 
-  o_phase_curr = platform->device.malloc(nmode, sizeof(dfloat));
-  o_phase_next = platform->device.malloc(nmode, sizeof(dfloat));
-  o_phase_curr.copyFrom(phase_current.data());
-  o_phase_next.copyFrom(phase_next.data());
+  o_phase_curr = platform->device.malloc(nmode * sizeof(dfloat));
+  o_phase_next = platform->device.malloc(nmode * sizeof(dfloat));
+  o_phase_curr.copyFrom(phase_current.data(), nmode * sizeof(dfloat));
+  o_phase_next.copyFrom(phase_next.data(), nmode * sizeof(dfloat));
+  trip_steps =
+      std::round(tdt / dt_LES); // Number of LES steps for one tripping tdt
+
   udf.uEqnSource = &userf;
 
   // Time averaging setup
-  tavg::setup(nrs);
+  // tavg::setup(nrs);
 
   // Interpolation setup
   setupInterpolators(nrs, obsInterpolator, o_ObsUbar, o_ObsVbar, o_ObsUprime,
@@ -600,7 +611,7 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
            F_lift, Cd, Cl);
 
     // Set field width and precision
-    const int width_int = 6;    // for tstep
+    const int width_int = 8;    // for tstep
     const int width_float = 15; // for floating point numbers
 
     // Write drag.txt
@@ -649,8 +660,8 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
   MPC_of_LSM(nrs, time, tstep);
 
   if (nrs->isOutputStep) {
-    const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
-    auto o_S0 = nrs->cds->o_S.slice(0 * fieldOffsetByte, fieldOffsetByte);
-    postProcessing::Qcriterion(nrs, o_S0);
+    // const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+    // auto o_S0 = nrs->cds->o_S.slice(0 * fieldOffsetByte, fieldOffsetByte);
+    // postProcessing::Qcriterion(nrs, o_S0);
   }
 }

@@ -7,12 +7,14 @@ deviceNumber = LOCAL-RANK
 
 [GENERAL]
 #verbose = true
-startFrom = "NACA0.f00015"
+startFrom = "restart_file_name+time=0.0"
 polynomialOrder = 7
-stopAt = endTime
-endTime = 100.0
+subCyclingSteps = 4
+stopAt =  endTime #numSteps#endTime
+endTime = 1.0
 
-dt = targetCFL=3 + max=5e-3 + initial=1e-5
+dt = 2.0e-5
+# dt = targetCFL=3.5 + max=2.5e-5
 timeStepper = tombo2
 
 writeControl = simulationTime 
@@ -22,37 +24,28 @@ regularization = hpfrt + nModes=1 + scalingCoeff=10
 
 [MESH]
 writeToFieldFile = true
-connectivityTol = 1.0
+# connectivityTol = 1.0
 
 [PRESSURE]
 residualTol = 1e-04
-# coarseGridDiscretization = SEMFEM
-# semfemSolver = boomerAMG+device
-# smootherType = RAS+FourthOptChebyshev
 
 [VELOCITY]
-boundaryTypeMap = codedFixedValue,fixedGradient,zeroValue,fixedGradient,codedFixedValue,none,none
+boundaryTypeMap = codedFixedValue,fixedGradient,zeroValue,codedFixedValue,fixedGradient,none,none
 viscosity = 1/200000
 density = 1.0
 residualTol = 1e-06
 
-[SCALAR00] #Qcriterion
+[SCALAR00] # Jet field
 solver = none
 
-[SCALAR01] #Tripping forcing
+[SCALAR01] # <U>
 solver = none
 
-[SCALAR02] #Jet forcing
+[SCALAR02] # <V> 
 solver = none
 
-# [BOOMERAMG]
-# coarsenType                 = HMIS              # PMIS also OK
-# interpolationType           = Ext+i             # or modified classical if Ext+i unavailable
-# iterations                  = 1                 # V(1,1); bump to 2 only if needed
-# strongThreshold             = 0.6               # 0.5–0.7 sweet spot
-# aggressiveCoarseningLevels  = 1
-# chebyshevRelaxOrder         = 2
-# nonGalerkinTol              = 0                 # try 0.01 later if SpMV dominates and convergence is robust
+[SCALAR03] # Tripping Field 
+solver = none
 
 [CASEDATA]
 U_inf = 1.0    # Freestream velocity.
@@ -75,7 +68,7 @@ jet_zc = 0.05       # Jet z centroid loc
 jet_ax = 0.02       # Length is about 5xjet_ax ~ magnitude > 0.01
 jet_ay = 0.01       # Height is about 3xjet_ay ~ magnitude > 0.01
 jet_az = 0.0062     # Width is about 4xjet_az ~ magnitude > 0.01
-jet_scale = 2.5     # Scaling parameter for forces
+jet_scale = 5     # Scaling parameter for forces
 jet_pitch = -45     # pitch angle for forces in degree
 jet_rota = 11       # roation angle for jet field in degree
 mpc_time_delay = 0.0    # time delay to start MPC
