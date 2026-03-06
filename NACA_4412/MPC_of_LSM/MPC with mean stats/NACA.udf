@@ -1,0 +1,1392 @@
+//
+// nekRS User Defined File
+//
+#include "plugins/tavg.hpp"
+#include "udf.hpp"
+#include <cmath>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <math.h>
+#include <random>
+#include <sstream>
+#include <string>
+#include <vector>
+
+
+#ifdef __okl__
+#include "NACA.oudf"
+#include "my_drag.oudf"
+#endif
+
+static dfloat U_inf;
+static dfloat AoA;
+static dfloat mu;
+static dfloat rho;
+static dfloat nu;
+static dfloat AoA_rad;
+static dfloat tdamp, rota;
+static dfloat sposx, sposy, sposz;
+static dfloat eposx, eposy, eposz;
+static dfloat smthx, smthy;
+static dfloat Lz;
+static int nmode;
+static dfloat tdt;
+
+static dfloat avg_time;
+static dfloat stat_dump_freq;
+static int Nz;
+
+static int trip_steps;
+static dfloat dt_LES;
+
+static std::vector<double> phase_current; // For h_i(z), size nmode
+static std::vector<double> phase_next;    // For h_{i+1}(z), size nmode
+static occa::memory o_phase_curr;
+static occa::memory o_phase_next;
+static int last_harmonic_index = 0;
+static std::mt19937_64 rng(12345); // seed once (or seed per run)
+static std::uniform_real_distribution<double> U01(0.0, 1.0);
+
+static dfloat *dragvx, *dragvy, *dragvz;
+static occa::memory o_dragvx, o_dragvy, o_dragvz;
+static dfloat *dragpx, *dragpy, *dragpz;
+static occa::memory o_dragpx, o_dragpy, o_dragpz;
+
+static dfloat jet_xc, jet_yc, jet_zc;
+static dfloat jet_ax, jet_ay, jet_az;
+static dfloat jet_scale, jet_pitch, jet_rota;
+static dfloat jet_input;
+
+static dfloat mpc_time_delay;
+static dfloat mpc_rom_time;
+static dfloat mpc_time_horizon;
+static dfloat mpc_meas_freq;
+static std::vector<double> u_optimal;
+
+static occa::memory o_interp_u, o_interp_v, o_interp_w;
+static occa::memory o_interp_u2, o_interp_v2, o_interp_w2;
+static occa::memory o_interp_uv, o_interp_vw, o_interp_wu;
+static pointInterpolation_t *normInterpolator = nullptr;
+static int interp_np = 0;
+static std::vector<dfloat> interp_loc_x, interp_loc_y, interp_loc_z;
+
+static occa::memory o_ObsUbar, o_ObsVbar, o_ObsUprime, o_CtrlVprime;
+static pointInterpolation_t *obsInterpolator = nullptr,
+                            *ctrlInterpolator = nullptr;
+static int obs_np = 0, ctrl_np = 0;
+
+// Reads x,y from file and replicates points across Nz planes to fill x,y,z.
+void readNormals(const std::string &filename,
+                        std::vector<dfloat> &x,
+                        std::vector<dfloat> &y,
+                        std::vector<dfloat> &z,
+                        int mpiRank,
+                        int Nz,
+                        dfloat Lz)
+{
+  x.clear();
+  y.clear();
+  z.clear();
+
+  if (mpiRank != 0) {
+    // Non-root ranks: do nothing
+    return;
+  }
+
+  if (Nz <= 0) {
+    std::cerr << "readNormals: Nz must be > 0\n";
+    return;
+  }
+
+  std::ifstream infile(filename);
+  if (!infile.is_open()) {
+    std::cerr << "Error opening file: " << filename << std::endl;
+    return;
+  }
+
+  // Build z-planes: midpoint rule avoids sampling exactly at periodic boundaries
+  std::vector<dfloat> zlist(Nz);
+  for (int j = 0; j < Nz; ++j) {
+    zlist[j] = ( (dfloat)j + 0.5 ) * (Lz / (dfloat)Nz);
+  }
+
+  std::string line;
+  int np_xy = 0;
+
+  // Read number of (x,y) points (first line)
+  if (std::getline(infile, line)) {
+    std::istringstream iss(line);
+    iss >> np_xy;
+  }
+
+  // Reserve total points replicated across Nz planes
+  const std::size_t np_total = (std::size_t)np_xy * (std::size_t)Nz;
+  x.reserve(np_total);
+  y.reserve(np_total);
+  z.reserve(np_total);
+
+  // Read x,y and replicate over zlist
+  int count_xy = 0;
+  while (std::getline(infile, line)) {
+    std::istringstream iss(line);
+    dfloat xi, yi;
+    if (iss >> xi >> yi) {
+      ++count_xy;
+
+      for (int j = 0; j < Nz; ++j) {
+        x.push_back(xi);
+        y.push_back(yi);
+        z.push_back(zlist[j]);
+      }
+    }
+  }
+
+  // Optional sanity warning if file count doesn't match header
+  if (np_xy > 0 && count_xy != np_xy) {
+    std::cerr << "readNormals warning: header np=" << np_xy
+              << " but read " << count_xy << " (x,y) points\n";
+  }
+}
+
+
+void writeNormalsMonitor(const std::string &filename, dfloat time,
+                         const std::vector<dfloat> &stations, int Np, int Nz,
+                         const std::vector<dfloat> &x,
+                         const std::vector<dfloat> &y,
+                         const std::vector<dfloat> &Umean,
+                         const std::vector<dfloat> &Vmean,
+                         const std::vector<dfloat> &Wmean,
+                         const std::vector<dfloat> &U2mean,
+                         const std::vector<dfloat> &V2mean,
+                         const std::vector<dfloat> &W2mean,
+                         const std::vector<dfloat> &UVmean,
+                         const std::vector<dfloat> &VWmean,
+                         const std::vector<dfloat> &WUmean)
+{
+  const int Ns = (int)stations.size();
+  const int NpTot = Np * Nz;
+
+  std::ofstream out(filename, std::ios::out | std::ios::trunc);
+  out << std::scientific << std::setprecision(6);
+
+  const dfloat invNz = 1.0 / (dfloat)Nz;
+
+  for (int i = 0; i < Ns; ++i) {
+
+    // base offset for this station in the 3D (Np*Nz) arrays
+    const std::size_t base3 = (std::size_t)i * (std::size_t)NpTot;
+
+    // helper: pointer to first z-sample for (i,k)
+    auto pbase = [&](int k) -> std::size_t {
+      return base3 + (std::size_t)k * (std::size_t)Nz;
+    };
+
+    // helper: span-average any field at (i,k)
+    auto zavg = [&](const std::vector<dfloat> &a, int k) -> dfloat {
+      const std::size_t b = pbase(k);
+      dfloat s = 0;
+      for (int j = 0; j < Nz; ++j) s += a[b + (std::size_t)j];
+      return s * invNz;
+    };
+
+    // x,y are replicated across z; just take j=0 for geometry
+    auto xk = [&](int k) -> dfloat { return x[pbase(k)]; };
+    auto yk = [&](int k) -> dfloat { return y[pbase(k)]; };
+
+    // Estimate normal from first two points (geometry only)
+    dfloat nx = xk(1) - xk(0);
+    dfloat ny = yk(1) - yk(0);
+    dfloat nrm = std::sqrt(nx*nx + ny*ny);
+    nx /= nrm; ny /= nrm;
+
+    dfloat tx = -ny;
+    dfloat ty =  nx;
+    if (tx < 0) { tx = -tx; ty = -ty; } // keep chordwise-ish sign convention
+
+    auto ydist = [&](int k) {
+      return (xk(k) - xk(0))*nx + (yk(k) - yk(0))*ny;
+    };
+
+    // ---- compute tau_w from span-averaged mean profile ----
+    const dfloat y1 = ydist(1);
+    const dfloat y2 = ydist(2);
+
+    const dfloat Um1 = zavg(Umean, 1);
+    const dfloat Vm1 = zavg(Vmean, 1);
+    const dfloat Um2 = zavg(Umean, 2);
+    const dfloat Vm2 = zavg(Vmean, 2);
+
+    const dfloat ut1 = Um1*tx + Vm1*ty;
+    const dfloat ut2 = Um2*tx + Vm2*ty;
+
+    dfloat tauw = 0.0, utau = 0.0;
+    if (y1 > 0 && y2 > y1) {
+      const dfloat b = y2 / (y1 * (y2 - y1));
+      const dfloat c = -y1 / (y2 * (y2 - y1));
+      const dfloat dutdn = b*ut1 + c*ut2;  // u0=0 enforced implicitly
+      tauw = mu * dutdn;
+      utau = std::sqrt(std::abs(tauw) / rho);
+    }
+
+    printf("time = %15.8e x/c = %5.2f: tau_w = %15.8e u_tau = %15.8e\n",
+           time, stations[i], tauw, utau);
+
+    // ----- headers -----
+    out << "\n==================================================================\n";
+    out << "# time = " << time << "\n";
+    out << "# x/c = " << stations[i] << "   tau_w = " << tauw
+        << "   u_tau = " << utau << "\n";
+    out << "==================================================================\n";
+
+    out << std::setw(4)  << "k"
+        << std::setw(15) << "y"
+        << std::setw(15) << "Umean"
+        << std::setw(15) << "Vmean"
+        << std::setw(15) << "ut"
+        << std::setw(15) << "vn"
+        << std::setw(15) << "y+"
+        << std::setw(15) << "U+"
+        << std::setw(15) << "V+"
+        << std::setw(15) << "W+"
+        << std::setw(15) << "uu+"
+        << std::setw(15) << "vv+"
+        << std::setw(15) << "ww+"
+        << "\n";
+
+    out << "-------------------------------------------------------------------\n";
+
+    // ----- rows (still Np rows) -----
+    const dfloat utau2 = utau * utau;
+
+    for (int k = 0; k < Np; ++k) {
+
+      // span-averaged means at this (i,k)
+      const dfloat Um = zavg(Umean, k);
+      const dfloat Vm = zavg(Vmean, k);
+      const dfloat Wm = zavg(Wmean, k);
+
+      // projections
+      const dfloat ut = Um*tx + Vm*ty;
+      const dfloat un = Um*nx + Vm*ny;
+
+      const dfloat ydist_k = std::max<dfloat>(ydist(k), 0);
+
+      // wall units
+      const dfloat yplus   = (utau > 0) ? (utau * ydist_k / nu) : 0;
+      const dfloat ut_plus = (utau > 0) ? (ut / utau) : 0;
+      const dfloat un_plus = (utau > 0) ? (un / utau) : 0;
+      const dfloat w_plus  = (utau > 0) ? (Wm / utau) : 0;
+
+      // span-averaged second moments/cross moments
+      const dfloat U2m = zavg(U2mean, k);
+      const dfloat V2m = zavg(V2mean, k);
+      const dfloat W2m = zavg(W2mean, k);
+      const dfloat UVm = zavg(UVmean, k);
+      // VWm/WUm not used for (t,n) in x-y plane; keep if you later rotate fully 3D
+      // const dfloat VWm = zavg(VWmean, k);
+      // const dfloat WUm = zavg(WUmean, k);
+
+      // Reynolds stresses in global Cartesian (fluctuating products)
+      dfloat uu = U2m - Um*Um;
+      dfloat vv = V2m - Vm*Vm;
+      dfloat ww = W2m - Wm*Wm;
+      dfloat uv = UVm - Um*Vm;
+
+      uu = (uu > 0 ? uu : 0);
+      vv = (vv > 0 ? vv : 0);
+      ww = (ww > 0 ? ww : 0);
+
+      // rotate to local (t,n) in x-y plane
+      dfloat utt = tx*tx*uu + 2*tx*ty*uv + ty*ty*vv; // <u_t'^2>
+      dfloat unn = nx*nx*uu + 2*nx*ny*uv + ny*ny*vv; // <u_n'^2>
+      dfloat uww = ww;                               // <w'^2>
+
+      utt = (utt > 0 ? utt : 0);
+      unn = (unn > 0 ? unn : 0);
+      uww = (uww > 0 ? uww : 0);
+
+      const dfloat uu_plus = (utau2 > 0) ? (utt / utau2) : 0;
+      const dfloat vv_plus = (utau2 > 0) ? (unn / utau2) : 0;
+      const dfloat ww_plus = (utau2 > 0) ? (uww / utau2) : 0;
+
+      out << std::setw(4)  << k
+          << std::setw(15) << ydist_k
+          << std::setw(15) << Um
+          << std::setw(15) << Vm
+          << std::setw(15) << ut
+          << std::setw(15) << un
+          << std::setw(15) << yplus
+          << std::setw(15) << ut_plus
+          << std::setw(15) << un_plus
+          << std::setw(15) << w_plus
+          << std::setw(15) << uu_plus
+          << std::setw(15) << vv_plus
+          << std::setw(15) << ww_plus
+          << "\n";
+    }
+  }
+
+  out.flush();
+}
+
+static inline std::size_t idx3(int i, int k, int j, int Np, int Nz)
+{
+  return ((std::size_t)i * (std::size_t)Np + (std::size_t)k) * (std::size_t)Nz + (std::size_t)j;
+}
+
+void writeNormalsRawVTK(const std::string &filename,
+                        dfloat time,
+                        const std::vector<dfloat> &stations, int Np, int Nz,
+                        const std::vector<dfloat> &x,
+                        const std::vector<dfloat> &y,
+                        const std::vector<dfloat> &z,
+                        const std::vector<dfloat> &Umean,
+                        const std::vector<dfloat> &Vmean,
+                        const std::vector<dfloat> &Wmean,
+                        const std::vector<dfloat> &U2mean,
+                        const std::vector<dfloat> &V2mean,
+                        const std::vector<dfloat> &W2mean,
+                        const std::vector<dfloat> &UVmean,
+                        const std::vector<dfloat> &VWmean,
+                        const std::vector<dfloat> &WUmean)
+{
+  const int Ns = (int)stations.size();
+
+  if (Np < 3 || Nz <= 0 || Ns <= 0) {
+    std::cerr << "writeNormalsRawVTK: bad sizes (Ns,Np,Nz)=("
+              << Ns << "," << Np << "," << Nz << ")\n";
+    return;
+  }
+
+  const std::size_t Npts_expected = (std::size_t)Ns * (std::size_t)Np * (std::size_t)Nz;
+  auto check = [&](const char* name, const std::vector<dfloat>& a){
+    if (a.size() != Npts_expected) {
+      std::cerr << "writeNormalsRawVTK: size mismatch for " << name
+                << " got " << a.size() << " expected " << Npts_expected << "\n";
+      return false;
+    }
+    return true;
+  };
+
+  if (!check("x",x) || !check("y",y) || !check("z",z) ||
+      !check("Umean",Umean) || !check("Vmean",Vmean) || !check("Wmean",Wmean) ||
+      !check("U2mean",U2mean) || !check("V2mean",V2mean) || !check("W2mean",W2mean) ||
+      !check("UVmean",UVmean) || !check("VWmean",VWmean) || !check("WUmean",WUmean)) {
+    return;
+  }
+
+  // Overwrite file each call
+  std::ofstream out(filename, std::ios::out | std::ios::trunc);
+  out << std::scientific << std::setprecision(8);
+
+  // ---- VTK legacy PolyData header ----
+  out << "# vtk DataFile Version 3.0\n";
+  out << "NEKRS normal probes raw (no span avg)\n";
+  out << "ASCII\n";
+  out << "DATASET POLYDATA\n";
+
+  // ---- POINTS ----
+  out << "POINTS " << Npts_expected << " float\n";
+  for (int i = 0; i < Ns; ++i) {
+    for (int k = 0; k < Np; ++k) {
+      for (int j = 0; j < Nz; ++j) {
+        const std::size_t id = idx3(i,k,j,Np,Nz);
+        out << (float)x[id] << " " << (float)y[id] << " " << (float)z[id] << "\n";
+      }
+    }
+  }
+
+  // ---- LINES: Ns*Nz polylines, each of length Np ----
+  const int Nlines = Ns * Nz;
+  const std::size_t ints_per_line = 1 + (std::size_t)Np;         // "Np idx0 idx1 ... "
+  const std::size_t total_ints = (std::size_t)Nlines * ints_per_line;
+
+  out << "LINES " << Nlines << " " << total_ints << "\n";
+
+  // Point ordering in file is: i-major, k-major, j-minor (inner loop j)
+  // That means the point id in VTK file is:
+  //   pid(i,k,j) = ((i*Np + k)*Nz + j)
+  // And for a fixed (i,j), k sweeps with stride Nz.
+  for (int i = 0; i < Ns; ++i) {
+    for (int j = 0; j < Nz; ++j) {
+      out << Np;
+      for (int k = 0; k < Np; ++k) {
+        const std::size_t pid = ((std::size_t)i*(std::size_t)Np + (std::size_t)k)*(std::size_t)Nz + (std::size_t)j;
+        out << " " << pid;
+      }
+      out << "\n";
+    }
+  }
+
+  // ---- POINT DATA ----
+  out << "POINT_DATA " << Npts_expected << "\n";
+
+  // Helper lambdas for geometry (use j=0 plane for normals/tangents per station)
+  auto xg = [&](int i, int k)->dfloat { return x[idx3(i,k,0,Np,Nz)]; };
+  auto yg = [&](int i, int k)->dfloat { return y[idx3(i,k,0,Np,Nz)]; };
+
+  // We will compute per-point derived stats using station-local (t,n) from geometry at j=0
+  // and tau_w/utau computed from that plane (per station per z-plane would be more expensive;
+  // for raw output, you can keep per-plane tauw later if you want).
+  std::vector<dfloat> nx_s(Ns), ny_s(Ns), tx_s(Ns), ty_s(Ns);
+  std::vector<dfloat> tauw_s(Ns,0.0), utau_s(Ns,0.0);
+
+  for (int i = 0; i < Ns; ++i) {
+    dfloat nx = xg(i,1) - xg(i,0);
+    dfloat ny = yg(i,1) - yg(i,0);
+    dfloat nrm = std::sqrt(nx*nx + ny*ny);
+    nx /= nrm; ny /= nrm;
+
+    dfloat tx = -ny, ty = nx;
+    if (tx < 0) { tx = -tx; ty = -ty; }
+
+    nx_s[i]=nx; ny_s[i]=ny; tx_s[i]=tx; ty_s[i]=ty;
+
+    auto ydist = [&](int k){
+      return (xg(i,k)-xg(i,0))*nx + (yg(i,k)-yg(i,0))*ny;
+    };
+
+    const dfloat y1 = ydist(1);
+    const dfloat y2 = ydist(2);
+
+    // Use span-mean tauw for metadata (could also do per-plane)
+    // Here we compute tauw from span-averaged Ut at k=1,2
+    dfloat ut1 = 0, ut2 = 0;
+    for (int j=0;j<Nz;++j){
+      const std::size_t id1 = idx3(i,1,j,Np,Nz);
+      const std::size_t id2 = idx3(i,2,j,Np,Nz);
+      ut1 += (Umean[id1]*tx + Vmean[id1]*ty);
+      ut2 += (Umean[id2]*tx + Vmean[id2]*ty);
+    }
+    ut1 /= (dfloat)Nz;
+    ut2 /= (dfloat)Nz;
+
+    if (y1 > 0 && y2 > y1) {
+      const dfloat b = y2 / (y1 * (y2 - y1));
+      const dfloat c = -y1 / (y2 * (y2 - y1));
+      const dfloat dutdn = b*ut1 + c*ut2;
+      const dfloat tauw = mu * dutdn;
+      tauw_s[i] = tauw;
+      utau_s[i] = std::sqrt(std::abs(tauw)/rho);
+    }
+  }
+
+  // ---- write raw mean vectors (global) ----
+  auto writeScalar = [&](const char* name, const std::vector<dfloat>& a){
+    out << "SCALARS " << name << " float 1\n";
+    out << "LOOKUP_TABLE default\n";
+    for (std::size_t p=0;p<Npts_expected;++p) out << (float)a[p] << "\n";
+  };
+
+  // station_xc (replicated)
+  out << "SCALARS station_xc float 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i)
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j)
+        out << (float)stations[i] << "\n";
+
+  // z-index and k-index for filtering
+  out << "SCALARS z_index int 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i)
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j)
+        out << j << "\n";
+
+  out << "SCALARS k_index int 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i)
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j)
+        out << k << "\n";
+
+  // tauw/utau replicated per station
+  out << "SCALARS tau_w float 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i)
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j)
+        out << (float)tauw_s[i] << "\n";
+
+  out << "SCALARS u_tau float 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i)
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j)
+        out << (float)utau_s[i] << "\n";
+
+  // raw mean components
+  writeScalar("Umean", Umean);
+  writeScalar("Vmean", Vmean);
+  writeScalar("Wmean", Wmean);
+
+  // ---- derived fields: ut, un, yplus, utplus, unplus, wplus, uuplus, vvplus, wwplus ----
+  out << "SCALARS yplus float 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i) {
+    const dfloat nx = nx_s[i], ny = ny_s[i], tx = tx_s[i], ty = ty_s[i];
+    auto ydist = [&](int k){
+      return (xg(i,k)-xg(i,0))*nx + (yg(i,k)-yg(i,0))*ny;
+    };
+    const dfloat utau = utau_s[i];
+    for (int k=0;k<Np;++k) {
+      const dfloat yk = std::max<dfloat>(ydist(k), 0);
+      const dfloat ypl = (utau>0) ? (utau*yk/nu) : 0;
+      for (int j=0;j<Nz;++j) out << (float)ypl << "\n"; // same for all j at fixed k
+    }
+  }
+
+  // ut and un
+  out << "SCALARS ut float 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i) {
+    const dfloat tx = tx_s[i], ty = ty_s[i];
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j) {
+        const std::size_t id = idx3(i,k,j,Np,Nz);
+        out << (float)(Umean[id]*tx + Vmean[id]*ty) << "\n";
+      }
+  }
+
+  out << "SCALARS un float 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i) {
+    const dfloat nx = nx_s[i], ny = ny_s[i];
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j) {
+        const std::size_t id = idx3(i,k,j,Np,Nz);
+        out << (float)(Umean[id]*nx + Vmean[id]*ny) << "\n";
+      }
+  }
+
+  // wall-unit velocities
+  out << "SCALARS utplus float 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i) {
+    const dfloat tx = tx_s[i], ty = ty_s[i];
+    const dfloat utau = utau_s[i];
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j) {
+        const std::size_t id = idx3(i,k,j,Np,Nz);
+        const dfloat ut = Umean[id]*tx + Vmean[id]*ty;
+        out << (float)((utau>0) ? (ut/utau) : 0) << "\n";
+      }
+  }
+
+  out << "SCALARS unplus float 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i) {
+    const dfloat nx = nx_s[i], ny = ny_s[i];
+    const dfloat utau = utau_s[i];
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j) {
+        const std::size_t id = idx3(i,k,j,Np,Nz);
+        const dfloat un = Umean[id]*nx + Vmean[id]*ny;
+        out << (float)((utau>0) ? (un/utau) : 0) << "\n";
+      }
+  }
+
+  out << "SCALARS wplus float 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i) {
+    const dfloat utau = utau_s[i];
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j) {
+        const std::size_t id = idx3(i,k,j,Np,Nz);
+        out << (float)((utau>0) ? (Wmean[id]/utau) : 0) << "\n";
+      }
+  }
+
+  // Reynolds normal stresses in local (t,n,w): uuplus= <ut'^2>/utau^2 etc (per point, no span avg)
+  out << "SCALARS uuplus float 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i) {
+    const dfloat nx = nx_s[i], ny = ny_s[i], tx = tx_s[i], ty = ty_s[i];
+    const dfloat utau = utau_s[i];
+    const dfloat utau2 = utau*utau;
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j) {
+        const std::size_t id = idx3(i,k,j,Np,Nz);
+        if (utau2 <= 0) { out << 0.0f << "\n"; continue; }
+
+        const dfloat Um = Umean[id], Vm = Vmean[id], Wm = Wmean[id];
+        dfloat uu = U2mean[id] - Um*Um;
+        dfloat vv = V2mean[id] - Vm*Vm;
+        dfloat uv = UVmean[id] - Um*Vm;
+
+        uu = (uu > 0 ? uu : 0);
+        vv = (vv > 0 ? vv : 0);
+
+        dfloat utt = tx*tx*uu + 2*tx*ty*uv + ty*ty*vv;
+        utt = (utt > 0 ? utt : 0);
+
+        out << (float)(utt/utau2) << "\n";
+      }
+  }
+
+  out << "SCALARS vvplus float 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i) {
+    const dfloat nx = nx_s[i], ny = ny_s[i], tx = tx_s[i], ty = ty_s[i];
+    const dfloat utau = utau_s[i];
+    const dfloat utau2 = utau*utau;
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j) {
+        const std::size_t id = idx3(i,k,j,Np,Nz);
+        if (utau2 <= 0) { out << 0.0f << "\n"; continue; }
+
+        const dfloat Um = Umean[id], Vm = Vmean[id], Wm = Wmean[id];
+        dfloat uu = U2mean[id] - Um*Um;
+        dfloat vv = V2mean[id] - Vm*Vm;
+        dfloat uv = UVmean[id] - Um*Vm;
+
+        uu = (uu > 0 ? uu : 0);
+        vv = (vv > 0 ? vv : 0);
+
+        dfloat unn = nx*nx*uu + 2*nx*ny*uv + ny*ny*vv;
+        unn = (unn > 0 ? unn : 0);
+
+        out << (float)(unn/utau2) << "\n";
+      }
+  }
+
+  out << "SCALARS wwplus float 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i) {
+    const dfloat utau = utau_s[i];
+    const dfloat utau2 = utau*utau;
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j) {
+        const std::size_t id = idx3(i,k,j,Np,Nz);
+        if (utau2 <= 0) { out << 0.0f << "\n"; continue; }
+
+        const dfloat Wm = Wmean[id];
+        dfloat ww = W2mean[id] - Wm*Wm;
+        ww = (ww > 0 ? ww : 0);
+
+        out << (float)(ww/utau2) << "\n";
+      }
+  }
+
+  out.flush();
+}
+
+void interpolateNormalPts(nrs_t *nrs, dfloat time, occa::memory o_Uavg, occa::memory o_Urms, occa::memory o_Urm2) {
+
+  // Interpolate velocity
+  const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+  occa::memory o_mean_u = o_Uavg.slice(0 * fieldOffsetByte, fieldOffsetByte);
+  occa::memory o_mean_v = o_Uavg.slice(1 * fieldOffsetByte, fieldOffsetByte);
+  occa::memory o_mean_w = o_Uavg.slice(2 * fieldOffsetByte, fieldOffsetByte);
+
+  normInterpolator->eval(1, nrs->fieldOffset, o_mean_u, interp_np, o_interp_u);
+  normInterpolator->eval(1, nrs->fieldOffset, o_mean_v, interp_np, o_interp_v);
+  normInterpolator->eval(1, nrs->fieldOffset, o_mean_w, interp_np, o_interp_w);
+
+  occa::memory o_mean_u2 = o_Urms.slice(0 * fieldOffsetByte, fieldOffsetByte);
+  occa::memory o_mean_v2 = o_Urms.slice(1 * fieldOffsetByte, fieldOffsetByte);
+  occa::memory o_mean_w2 = o_Urms.slice(2 * fieldOffsetByte, fieldOffsetByte);
+
+  normInterpolator->eval(1, nrs->fieldOffset, o_mean_u2, interp_np, o_interp_u2);
+  normInterpolator->eval(1, nrs->fieldOffset, o_mean_v2, interp_np, o_interp_v2);
+  normInterpolator->eval(1, nrs->fieldOffset, o_mean_w2, interp_np, o_interp_w2);
+
+  occa::memory o_mean_uv = o_Urm2.slice(0 * fieldOffsetByte, fieldOffsetByte);
+  occa::memory o_mean_vw = o_Urm2.slice(1 * fieldOffsetByte, fieldOffsetByte);
+  occa::memory o_mean_wu = o_Urm2.slice(2 * fieldOffsetByte, fieldOffsetByte);
+
+  normInterpolator->eval(1, nrs->fieldOffset, o_mean_uv, interp_np, o_interp_uv);
+  normInterpolator->eval(1, nrs->fieldOffset, o_mean_vw, interp_np, o_interp_vw);
+  normInterpolator->eval(1, nrs->fieldOffset, o_mean_wu, interp_np, o_interp_wu);
+
+  if (platform->comm.mpiRank == 0) {
+    std::vector<dfloat> interp_u(interp_np), interp_v(interp_np), interp_w(interp_np);
+    std::vector<dfloat> interp_u2(interp_np), interp_v2(interp_np), interp_w2(interp_np);
+    std::vector<dfloat> interp_uv(interp_np), interp_vw(interp_np), interp_wu(interp_np);
+    o_interp_u.copyTo(interp_u.data());
+    o_interp_v.copyTo(interp_v.data());
+    o_interp_w.copyTo(interp_w.data());
+    o_interp_u2.copyTo(interp_u2.data());
+    o_interp_v2.copyTo(interp_v2.data());
+    o_interp_w2.copyTo(interp_w2.data());
+    o_interp_uv.copyTo(interp_uv.data());
+    o_interp_vw.copyTo(interp_vw.data());
+    o_interp_wu.copyTo(interp_wu.data());
+    const int Ns = 10;
+    const int Np = 100;
+    std::vector<dfloat> stations(Ns);
+    for (int i = 0; i < Ns; ++i)
+      stations[i] = 0.1 + (1.0 - 0.1) * (dfloat)i / (dfloat)(Ns - 1);
+
+    writeNormalsMonitor("normal_mean_statistic_prof.txt", time, stations, Np, Nz,
+                        interp_loc_x, interp_loc_y, 
+                        interp_u, interp_v, interp_w,
+                        interp_u2,interp_v2,interp_w2,
+                        interp_uv,interp_vw,interp_wu);
+    writeNormalsRawVTK("normal_mean_statistic_prof.vtk", time, stations, Np, Nz,
+                        interp_loc_x, interp_loc_y, interp_loc_z,
+                        interp_u, interp_v, interp_w,
+                        interp_u2,interp_v2,interp_w2,
+                        interp_uv,interp_vw,interp_wu);
+  }
+}
+
+void compute_dump_stats(nrs_t *nrs, dfloat time) {
+  static bool initialized = false;
+  static occa::memory o_Uavg;
+  static occa::memory o_Urms;
+  static occa::memory o_Urm2;
+  static dfloat last_dump_time;
+
+  if (!initialized) {
+    if (!normInterpolator) {
+      readNormals("NACA4412_normals_ravel.txt", interp_loc_x, interp_loc_y,
+                   interp_loc_z, platform->comm.mpiRank, Nz, Lz);
+      interp_np = interp_loc_x.size();
+      o_interp_u = platform->device.malloc(interp_np, sizeof(dfloat));
+      o_interp_v = platform->device.malloc(interp_np, sizeof(dfloat));
+      o_interp_w = platform->device.malloc(interp_np, sizeof(dfloat));
+      o_interp_u2 = platform->device.malloc(interp_np, sizeof(dfloat));
+      o_interp_v2 = platform->device.malloc(interp_np, sizeof(dfloat));
+      o_interp_w2 = platform->device.malloc(interp_np, sizeof(dfloat));
+      o_interp_uv = platform->device.malloc(interp_np, sizeof(dfloat));
+      o_interp_vw = platform->device.malloc(interp_np, sizeof(dfloat));
+      o_interp_wu = platform->device.malloc(interp_np, sizeof(dfloat));
+      normInterpolator = new pointInterpolation_t(nrs);
+      normInterpolator->setPoints(interp_np, interp_loc_x.data(),
+                                  interp_loc_y.data(), interp_loc_z.data());
+      normInterpolator->find();
+    }
+    last_dump_time = time + stat_dump_freq;
+    initialized = true;
+  }
+  if (time >= last_dump_time) {
+    o_Uavg = tavg::get_o_Uavg();
+    o_Urms = tavg::get_o_Urms();
+    o_Urm2 = tavg::get_o_Urm2();
+    interpolateNormalPts(nrs, time, o_Uavg, o_Urms, o_Urm2);
+    last_dump_time += stat_dump_freq;
+  }
+}
+
+struct Force {
+  dfloat x;
+  dfloat y;
+  dfloat z;
+};
+
+/* Viscous Drag and Pressure Drag */
+Force compute_dragv(nrs_t *nrs, int nbID, const occa::memory &o_bID,
+                    occa::memory &o_Sij, const dfloat scale) {
+  mesh_t *mesh = nrs->meshV;
+  Force dragv;
+
+  if (o_dragvx.size() == 0) {
+    dragvx = (dfloat *)calloc(mesh->Nelements, sizeof(dfloat));
+    dragvy = (dfloat *)calloc(mesh->Nelements, sizeof(dfloat));
+    dragvz = (dfloat *)calloc(mesh->Nelements, sizeof(dfloat));
+    o_dragvx = platform->device.malloc(mesh->Nelements, sizeof(dfloat));
+    o_dragvy = platform->device.malloc(mesh->Nelements, sizeof(dfloat));
+    o_dragvz = platform->device.malloc(mesh->Nelements, sizeof(dfloat));
+  }
+
+  dragvKernel(mesh->Nelements, nrs->fieldOffset, nbID, o_bID, mesh->o_sgeo,
+              mesh->o_vmapM, mesh->o_EToB, nrs->o_mue, o_Sij, o_dragvx,
+              o_dragvy, o_dragvz);
+
+  o_dragvx.copyTo(dragvx);
+  o_dragvy.copyTo(dragvy);
+  o_dragvz.copyTo(dragvz);
+
+  dragv.x = 0.0;
+  dragv.y = 0.0;
+  dragv.z = 0.0;
+  for (dlong i = 0; i < mesh->Nelements; i++) {
+    dragv.x += dragvx[i];
+    dragv.y += dragvy[i];
+    dragv.z += dragvz[i];
+  }
+  MPI_Allreduce(MPI_IN_PLACE, &dragv.x, 1, MPI_DFLOAT, MPI_SUM,
+                platform->comm.mpiComm);
+  MPI_Allreduce(MPI_IN_PLACE, &dragv.y, 1, MPI_DFLOAT, MPI_SUM,
+                platform->comm.mpiComm);
+  MPI_Allreduce(MPI_IN_PLACE, &dragv.z, 1, MPI_DFLOAT, MPI_SUM,
+                platform->comm.mpiComm);
+  dragv.x *= scale;
+  dragv.y *= scale;
+  dragv.z *= scale;
+
+  return dragv;
+}
+
+Force compute_dragp(nrs_t *nrs, int nbID, const occa::memory &o_bID,
+                    occa::memory &o_P, const dfloat scale) {
+  mesh_t *mesh = nrs->meshV;
+  Force dragp;
+
+  if (o_dragpx.size() == 0) {
+    dragpx = (dfloat *)calloc(mesh->Nelements, sizeof(dfloat));
+    dragpy = (dfloat *)calloc(mesh->Nelements, sizeof(dfloat));
+    dragpz = (dfloat *)calloc(mesh->Nelements, sizeof(dfloat));
+    o_dragpx = platform->device.malloc(mesh->Nelements, sizeof(dfloat));
+    o_dragpy = platform->device.malloc(mesh->Nelements, sizeof(dfloat));
+    o_dragpz = platform->device.malloc(mesh->Nelements, sizeof(dfloat));
+  }
+
+  dragpKernel(mesh->Nelements, nrs->fieldOffset, nbID, o_bID, mesh->o_sgeo,
+              mesh->o_vmapM, mesh->o_EToB, o_P, o_dragpx, o_dragpy, o_dragpz);
+
+  o_dragpx.copyTo(dragpx);
+  o_dragpy.copyTo(dragpy);
+  o_dragpz.copyTo(dragpz);
+
+  dragp.x = 0.0;
+  dragp.y = 0.0;
+  dragp.z = 0.0;
+  for (dlong i = 0; i < mesh->Nelements; i++) {
+    dragp.x += dragpx[i];
+    dragp.y += dragpy[i];
+    dragp.z += dragpz[i];
+  }
+  MPI_Allreduce(MPI_IN_PLACE, &dragp.x, 1, MPI_DFLOAT, MPI_SUM,
+                platform->comm.mpiComm);
+  MPI_Allreduce(MPI_IN_PLACE, &dragp.y, 1, MPI_DFLOAT, MPI_SUM,
+                platform->comm.mpiComm);
+  MPI_Allreduce(MPI_IN_PLACE, &dragp.z, 1, MPI_DFLOAT, MPI_SUM,
+                platform->comm.mpiComm);
+  dragp.x *= scale;
+  dragp.y *= scale;
+  dragp.z *= scale;
+
+  return dragp;
+}
+
+void randomize_modes(std::vector<double> &phases) {
+  for (int n = 0; n < nmode; ++n) {
+    phases[n] = 2.0 * M_PI * U01(rng);
+  }
+}
+
+inline double eval_h_theta_phased(const double theta,
+                                  const std::vector<double> &phases) {
+  double s = 0.0;
+  for (int n = 0; n < nmode; ++n) {
+    s += std::sin(n * theta + phases[n]);
+  }
+  return s;
+}
+
+void generate_tripping_forces(nrs_t *nrs, dfloat time, occa::memory o_FU) {
+  auto *mesh = nrs->meshV;
+  const int Np = mesh->Nlocal;
+  const double Tu = tdamp;
+  const double t_s = tdt;
+  const double alpha = rota;
+  const double x0 = sposx, y0 = sposy;
+  const double z0 = sposz, z1 = eposz;
+
+  // hoisted constants
+  const double ca = std::cos(alpha);
+  const double sa = std::sin(alpha);
+  const double invSmx = 1.0 / smthx;
+  const double invSmy = 1.0 / smthy;
+  const double invLz = 1.0 / Lz;
+
+  // time blending
+  const auto tstep = nrs->tstep;
+  const int m = trip_steps; // e.g., round(ts / dt_ref)
+  const int i = tstep / m;
+  const int k = tstep % m;
+  const dfloat p = (dfloat)k / (dfloat)m;
+  const dfloat bt = (3.0 - 2.0 * p) * p * p; // 3p^2 - 2p^3
+
+  if (i != last_harmonic_index) {
+    // phase_current <- phase_next (device-to-device copy)
+    o_phase_curr.copyFrom(o_phase_next, nmode * sizeof(dfloat));
+    // o_phase_curr.copyTo(phase_current.data(), nmode * sizeof(dfloat));
+    // phase_next <- new random (host -> device)
+    if (platform->comm.mpiRank == 0)
+      randomize_modes(phase_next);
+    MPI_Bcast(phase_next.data(), nmode, MPI_DFLOAT, 0, platform->comm.mpiComm);
+    o_phase_next.copyFrom(phase_next.data(), nmode * sizeof(dfloat));
+    last_harmonic_index = i;
+  }
+
+  fill_FU_trip(mesh->Nlocal, nrs->fieldOffset, mesh->o_x, mesh->o_y, mesh->o_z,
+               x0, y0, z0, z1, invSmx, invSmy, invLz, ca, sa, o_phase_curr,
+               o_phase_next, nmode, Tu, bt, o_FU);
+
+  if (nrs->isOutputStep) {
+    const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+    auto o_FUy = nrs->o_FU.slice(1 * fieldOffsetByte, fieldOffsetByte);
+    auto o_S3 = nrs->cds->o_S.slice(3 * fieldOffsetByte, fieldOffsetByte);
+    o_S3.copyFrom(o_FUy);
+  }
+}
+
+void set_jet_field(nrs_t *nrs, dfloat time, occa::memory o_FU) {
+  auto *mesh = nrs->meshV;
+  const double cos_rota = std::cos(jet_rota * M_PI / 180.0);
+  const double sin_rota = std::sin(jet_rota * M_PI / 180.0);
+  const double cos_pitch = std::cos(jet_pitch * M_PI / 180.0);
+  const double sin_pitch = std::sin(jet_pitch * M_PI / 180.0);
+
+  const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+  auto o_S0 = nrs->cds->o_S.slice(0 * fieldOffsetByte, fieldOffsetByte);
+
+  fill_FU_jet(mesh->Nlocal, nrs->fieldOffset, mesh->o_x, mesh->o_y, mesh->o_z,
+              jet_xc, jet_yc, jet_zc, jet_ax, jet_ay, jet_az, jet_input,
+              jet_scale, cos_rota, sin_rota, cos_pitch, sin_pitch, o_FU, o_S0);
+}
+
+void userf(nrs_t *nrs, dfloat time, occa::memory o_U, occa::memory o_FU) {
+  generate_tripping_forces(nrs, time, o_FU);
+  set_jet_field(nrs, time, o_FU);
+}
+
+// Reads x, y, z coordinates from file and fills vectors
+void readGridFile(const std::string &filename, std::vector<dfloat> &x,
+                  std::vector<dfloat> &y, std::vector<dfloat> &z, int mpiRank) {
+  x.clear();
+  y.clear();
+  z.clear();
+
+  if (mpiRank != 0) {
+    // Non-root ranks: do nothing, vectors remain empty
+    return;
+  }
+
+  // Only rank 0 executes this part:
+  std::ifstream infile(filename);
+  if (!infile.is_open()) {
+    std::cerr << "Error opening file: " << filename << std::endl;
+    return;
+  }
+
+  std::string line;
+  int np = 0;
+
+  // Read number of points
+  if (std::getline(infile, line)) {
+    std::istringstream iss(line);
+    iss >> np;
+  }
+
+  x.reserve(np);
+  y.reserve(np);
+  z.reserve(np);
+
+  // Read coordinates
+  while (std::getline(infile, line)) {
+    std::istringstream iss(line);
+    dfloat xi, yi, zi;
+    if (iss >> xi >> yi >> zi) {
+      x.push_back(xi);
+      y.push_back(yi);
+      z.push_back(zi);
+    }
+  }
+}
+
+void setupInterpolators(nrs_t *nrs, pointInterpolation_t *&obsInterpolator,
+                        occa::memory &o_ObsUbar, occa::memory &o_ObsVbar,
+                        occa::memory &o_ObsUprime, int &obs_np,
+                        pointInterpolation_t *&ctrlInterpolator,
+                        occa::memory &o_CtrlVprime, int &ctrl_np) {
+
+  static std::vector<dfloat> obs_x, obs_y, obs_z;
+  static std::vector<dfloat> ctrl_x, ctrl_y, ctrl_z;
+
+  // Read grid files only once
+  if (!obsInterpolator) {
+    readGridFile("observation_grid.txt", obs_x, obs_y, obs_z,
+                 platform->comm.mpiRank);
+    obs_np = obs_x.size();
+    o_ObsUbar = platform->device.malloc(obs_np, sizeof(dfloat));
+    o_ObsVbar = platform->device.malloc(obs_np, sizeof(dfloat));
+    o_ObsUprime = platform->device.malloc(obs_np, sizeof(dfloat));
+    obsInterpolator = new pointInterpolation_t(nrs);
+    obsInterpolator->setPoints(obs_np, obs_x.data(), obs_y.data(),
+                               obs_z.data());
+    obsInterpolator->find();
+  }
+  if (!ctrlInterpolator) {
+    readGridFile("control_grid.txt", ctrl_x, ctrl_y, ctrl_z,
+                 platform->comm.mpiRank);
+    ctrl_np = ctrl_x.size();
+    o_CtrlVprime = platform->device.malloc(ctrl_np, sizeof(dfloat));
+    ctrlInterpolator = new pointInterpolation_t(nrs);
+    ctrlInterpolator->setPoints(ctrl_np, ctrl_x.data(), ctrl_y.data(),
+                                ctrl_z.data());
+    ctrlInterpolator->find();
+  }
+}
+
+void interpolateObsGrid(nrs_t *nrs, dfloat time, int tstep,
+                        occa::memory o_mean_vx, occa::memory o_mean_vy) {
+
+  static bool initialized = false;
+  if (!initialized) {
+    // Interpolate U_bar fluctuation
+    obsInterpolator->eval(1, nrs->fieldOffset, o_mean_vx, obs_np, o_ObsUbar);
+    // Interpolate V_bar fluctuation
+    obsInterpolator->eval(1, nrs->fieldOffset, o_mean_vy, obs_np, o_ObsVbar);
+    initialized = true;
+  }
+  // Interpolate velocity
+  const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+
+  // Interpolate velocity fluctuation (if available)
+  occa::memory ux_prime =
+      platform->device.malloc(nrs->fieldOffset, sizeof(dfloat));
+  occa::memory o_ux = nrs->o_U.slice(0 * fieldOffsetByte, fieldOffsetByte);
+  platform->linAlg->axpbyz(nrs->meshV->Nlocal, 1.0, o_ux, -1.0, o_mean_vx,
+                           ux_prime);
+  obsInterpolator->eval(1, nrs->fieldOffset, ux_prime, obs_np, o_ObsUprime);
+
+  if (platform->comm.mpiRank == 0) {
+    std::vector<dfloat> ObsUbar(obs_np);
+    std::vector<dfloat> ObsVbar(obs_np);
+    std::vector<dfloat> ObsUprime(obs_np);
+    o_ObsUbar.copyTo(ObsUbar.data());
+    o_ObsVbar.copyTo(ObsVbar.data());
+    o_ObsUprime.copyTo(ObsUprime.data());
+
+    std::ofstream fout("observation_grid_data.txt",
+                       std::ios::trunc); // 'replace' mode
+
+    printf("Writing new LSM data into observation_grid_data.txt ... ");
+    fout << "#time = " << std::setprecision(7) << std::scientific << time
+         << std::endl;
+    fout << "#  <u>  <v>  u_prime" << std::endl;
+
+    for (int i = 0; i < obs_np; ++i) {
+      fout << std::setw(15) << std::setprecision(8) << std::scientific
+           << ObsUbar[i] << " " << std::setw(15) << std::setprecision(8)
+           << std::scientific << ObsVbar[i] << " " << std::setw(15)
+           << std::setprecision(8) << std::scientific << ObsUprime[i]
+           << std::endl;
+    }
+    fout.close();
+    printf("Done \n");
+  }
+}
+
+void interpolateCtrlGrid(nrs_t *nrs, dfloat time, int tstep,
+                         dfloat last_u_optimal, occa::memory o_mean_vy) {
+
+  // Interpolate velocity
+  const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+
+  // Interpolate vertical velocity fluctuation
+  occa::memory vy_prime =
+      platform->device.malloc(nrs->fieldOffset, sizeof(dfloat));
+  occa::memory o_vy = nrs->o_U.slice(1 * fieldOffsetByte, fieldOffsetByte);
+  platform->linAlg->axpbyz(nrs->meshV->Nlocal, 1.0, o_vy, -1.0, o_mean_vy,
+                           vy_prime);
+  ctrlInterpolator->eval(1, nrs->fieldOffset, vy_prime, ctrl_np, o_CtrlVprime);
+
+  if (platform->comm.mpiRank == 0) {
+    std::vector<dfloat> CtrlVprime(ctrl_np);
+    o_CtrlVprime.copyTo(CtrlVprime.data());
+
+    std::ofstream fout("control_grid_data.txt", std::ios::trunc);
+
+    printf("Writing new LSM data into control_grid_data.txt ... ");
+    fout << "#time = " << std::setprecision(7) << std::scientific << time
+         << std::endl;
+    fout << std::setw(15) << std::setprecision(8) << std::scientific
+         << last_u_optimal << std::endl;
+    fout << "#  v_prime " << std::endl;
+
+    for (int i = 0; i < ctrl_np; ++i) {
+      fout << std::setw(15) << std::setprecision(8) << std::scientific
+           << CtrlVprime[i] << std::endl;
+    }
+    fout.close();
+    printf("Done \n");
+  }
+}
+
+void solveQPandBroadcast(int n_mpc_rom, std::vector<double> &u_optimal) {
+  // Only resize if size might change
+  if (u_optimal.size() != n_mpc_rom) {
+    u_optimal.resize(n_mpc_rom);
+  }
+  if (platform->comm.mpiRank == 0) {
+    int ret = system("python3 MPC_of_LSM_LQT.py");
+    if (ret != 0) {
+      std::cerr << "Error: Python script failed with code " << ret << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    std::ifstream fin("u_optimal.txt");
+    if (!fin.is_open()) {
+      std::cerr << "Error opening file: u_optimal.txt" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < n_mpc_rom; ++i) {
+      if (!(fin >> u_optimal[i])) {
+        std::cerr << "Error reading data at line " << (i + 1) << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+    }
+    fin.close();
+  }
+  MPI_Bcast(u_optimal.data(), n_mpc_rom, MPI_DFLOAT, 0, platform->comm.mpiComm);
+}
+
+void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep) {
+  static bool initialized = false;
+  static double last_mpc_update_time;
+  static std::vector<double> u_optimal;
+  static occa::memory o_mean_vx, o_mean_vy;
+
+  if (!initialized) {
+    const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+    o_mean_vx = platform->device.malloc(fieldOffsetByte);
+    o_mean_vy = platform->device.malloc(fieldOffsetByte);
+    // --- copy restart means from o_S slices into these buffers ---
+    o_mean_vx.copyFrom(nrs->cds->o_S.slice(1 * fieldOffsetByte, fieldOffsetByte));
+    o_mean_vy.copyFrom(nrs->cds->o_S.slice(2 * fieldOffsetByte, fieldOffsetByte));
+    mpc_time_delay += time; // first allowed MPC update
+    last_mpc_update_time = mpc_time_delay;
+    u_optimal.assign(mpc_time_horizon, 0.0);
+    initialized = true;
+  }
+
+  if (time < mpc_time_delay) {
+    jet_input = 0.0;
+    if (platform->comm.mpiRank == 0) {
+      std::ofstream fout("jet_input.txt", std::ios::app);
+      // First three columns: width 6, default notation
+      fout << std::setw(8) << tstep << " ";
+      fout << std::setw(6) << std::setprecision(4) << std::scientific << time
+           << " ";
+      fout << std::setw(6) << std::setprecision(4) << jet_input << std::endl;
+      fout.close();
+    }
+    return;
+  }
+
+  if (time >= last_mpc_update_time) {
+    interpolateObsGrid(nrs, time, tstep, o_mean_vx, o_mean_vy);
+    interpolateCtrlGrid(nrs, time, tstep, jet_input, o_mean_vy);
+    solveQPandBroadcast(mpc_time_horizon, u_optimal);
+    last_mpc_update_time += mpc_meas_freq; // set next allowed MPC update time
+  }
+  // Compute control index for current time
+  double time_since_mpc = time - last_mpc_update_time + mpc_meas_freq;
+  int ctrl_idx = static_cast<int>(time_since_mpc / mpc_rom_time);
+  if (ctrl_idx >= mpc_time_horizon)
+    ctrl_idx = mpc_time_horizon - 1;
+
+  jet_input = u_optimal[ctrl_idx];
+  if (platform->comm.mpiRank == 0) {
+    printf("%d %15.8e ctrl_idx: %d u_optimal: %15.8e jet_input: %15.8e \n",
+           tstep, time, ctrl_idx, u_optimal[ctrl_idx], jet_input);
+    std::ofstream fout("jet_input.txt", std::ios::app);
+    // First three columns: width 6, default notation
+    fout << std::setw(8) << tstep << " ";
+    fout << std::setw(6) << std::setprecision(4) << std::scientific << time
+         << " ";
+    fout << std::setw(6) << std::setprecision(4) << jet_input << std::endl;
+    fout.close();
+  }
+}
+
+/* UDF Functions */
+
+void UDF_LoadKernels(occa::properties &kernelInfo) {
+  kernelInfo["defines/p_U_inf"] = U_inf;
+  kernelInfo["defines/p_AoA"] = AoA;
+  kernelInfo["defines/p_pi"] = M_PI;
+}
+
+void UDF_Setup0(MPI_Comm comm, setupAide &options) {
+
+  platform->par->extract("casedata", "U_inf", U_inf);
+  platform->par->extract("casedata", "AoA", AoA);
+
+  platform->par->extract("casedata", "TDAMP", tdamp);
+  platform->par->extract("casedata", "SPOSX", sposx);
+  platform->par->extract("casedata", "SPOSY", sposy);
+  platform->par->extract("casedata", "SPOSZ", sposz);
+  platform->par->extract("casedata", "EPOSX", eposx);
+  platform->par->extract("casedata", "EPOSY", eposy);
+  platform->par->extract("casedata", "EPOSZ", eposz);
+  platform->par->extract("casedata", "SMTHX", smthx);
+  platform->par->extract("casedata", "SMTHY", smthy);
+  platform->par->extract("casedata", "ROTA", rota);
+  platform->par->extract("casedata", "NMODE", nmode);
+  platform->par->extract("casedata", "TDT", tdt);
+
+  platform->par->extract("casedata", "avg_time", avg_time);
+  platform->par->extract("casedata", "stat_dump_freq", stat_dump_freq);
+  platform->par->extract("casedata", "Nz", Nz);
+
+  platform->par->extract("casedata", "jet_xc", jet_xc);
+  platform->par->extract("casedata", "jet_yc", jet_yc);
+  platform->par->extract("casedata", "jet_zc", jet_zc);
+  platform->par->extract("casedata", "jet_ax", jet_ax);
+  platform->par->extract("casedata", "jet_ay", jet_ay);
+  platform->par->extract("casedata", "jet_az", jet_az);
+  platform->par->extract("casedata", "jet_scale", jet_scale);
+  platform->par->extract("casedata", "jet_pitch", jet_pitch);
+  platform->par->extract("casedata", "jet_rota", jet_rota);
+
+  platform->par->extract("casedata", "mpc_time_delay", mpc_time_delay);
+  platform->par->extract("casedata", "mpc_rom_time", mpc_rom_time);
+  platform->par->extract("casedata", "mpc_time_horizon", mpc_time_horizon);
+  platform->par->extract("casedata", "mpc_meas_freq", mpc_meas_freq);
+
+  *((double *)nek::scPtr(1)) = U_inf;
+  *((double *)nek::scPtr(2)) = AoA;
+
+  
+  platform->options.getArgs("DT", dt_LES);
+
+  platform->options.getArgs("VISCOSITY", mu);
+  platform->options.getArgs("DENSITY", rho);
+  nu = mu / rho;
+}
+
+void UDF_Setup(nrs_t *nrs) {
+  mesh_t *mesh = nrs->meshV;
+  if (platform->options.getArgs("RESTART FILE NAME").empty()) {
+    for (int i = 0; i < mesh->Nlocal; ++i) {
+      nrs->U[i + 0 * nrs->fieldOffset] = U_inf * cos(AoA * M_PI / 180.0);
+      nrs->U[i + 1 * nrs->fieldOffset] = U_inf * sin(AoA * M_PI / 180.0);
+      nrs->U[i + 2 * nrs->fieldOffset] = 0.0;
+    }
+  }
+  Lz = std::abs(eposz - sposz);
+  AoA_rad = AoA * M_PI / 180.0;
+  phase_current.resize(nmode, 0.0);
+  phase_next.resize(nmode, 0.0);
+  if (platform->comm.mpiRank == 0) {
+    randomize_modes(phase_current);
+    randomize_modes(phase_next);
+  }
+  MPI_Bcast(phase_current.data(), nmode, MPI_DFLOAT, 0, platform->comm.mpiComm);
+  MPI_Bcast(phase_next.data(), nmode, MPI_DFLOAT, 0, platform->comm.mpiComm);
+
+  o_phase_curr = platform->device.malloc(nmode * sizeof(dfloat));
+  o_phase_next = platform->device.malloc(nmode * sizeof(dfloat));
+  o_phase_curr.copyFrom(phase_current.data(), nmode * sizeof(dfloat));
+  o_phase_next.copyFrom(phase_next.data(), nmode * sizeof(dfloat));
+  trip_steps =
+      std::round(tdt / dt_LES); // Number of LES steps for one tripping tdt
+
+  udf.uEqnSource = &userf;
+
+  // Time averaging setup
+  tavg::setup(nrs);
+
+  // Interpolation setup
+  setupInterpolators(nrs, obsInterpolator, o_ObsUbar, o_ObsVbar, o_ObsUprime,
+                     obs_np, ctrlInterpolator, o_CtrlVprime, ctrl_np);
+  
+  // Setting jet_input = 0 for baseline
+  // jet_input = 0.0;
+}
+
+void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
+  // compute drag
+  std::vector<int> bidWall = {3};
+  occa::memory o_bidWall =
+      platform->device.malloc(bidWall.size() * sizeof(int), bidWall.data());
+
+  // C = F/(.5 rho U^2 * A) = 2*F, A=c*Lz, rho=1, U=U_inf
+  const dfloat scale = 1.0;
+  auto o_Sij = platform->device.malloc(2 * nrs->NVfields * nrs->fieldOffset,
+                                       sizeof(dfloat));
+  postProcessing::strainRate(nrs, true, o_Sij); // "false" is correct
+
+  Force dragv = compute_dragv(nrs, bidWall.size(), o_bidWall, o_Sij, scale);
+  Force dragp = compute_dragp(nrs, bidWall.size(), o_bidWall, nrs->o_P, scale);
+  o_Sij.free();
+
+  Force drag;
+  drag.x = dragp.x + dragv.x;
+  drag.y = dragp.y + dragv.y;
+  drag.z = dragp.z + dragv.z;
+
+  double F_drag = drag.x * cos(AoA_rad) + drag.y * sin(AoA_rad);
+  double F_lift = -drag.x * sin(AoA_rad) + drag.y * cos(AoA_rad);
+
+  double Cd = F_drag / (0.5 * Lz);
+  double Cl = F_lift / (0.5 * Lz);
+
+  if (platform->comm.mpiRank == 0) {
+
+    std::ofstream drag_file("drag.txt", std::ios::app);
+    std::ofstream lift_file("lift.txt", std::ios::app);
+    std::ofstream dragz_file("dragz.txt", std::ios::app);
+    std::ofstream forces_file("forces.txt", std::ios::app);
+
+    printf("%d %15.8e %15.8e %15.8e %15.8e dragx(rs)\n", tstep, time, drag.x,
+           dragp.x, dragv.x);
+    printf("%d %15.8e %15.8e %15.8e %15.8e dragy(rs)\n", tstep, time, drag.y,
+           dragp.y, dragv.y);
+    printf("%d %15.8e %15.8e %15.8e %15.8e dragz(rs)\n", tstep, time, drag.z,
+           dragp.z, dragv.z);
+    printf("%d %15.8e %15.8e %15.8e %15.8e %15.8e \n", tstep, time, F_drag,
+           F_lift, Cd, Cl);
+
+    // Set field width and precision
+    const int width_int = 8;    // for tstep
+    const int width_float = 15; // for floating point numbers
+
+    // Write drag.txt
+    if (drag_file.is_open()) {
+      drag_file << std::setw(width_int) << tstep << " "
+                << std::setw(width_float) << std::setprecision(8)
+                << std::scientific << time << " " << std::setw(width_float)
+                << drag.x << " " << std::setw(width_float) << dragp.x << " "
+                << std::setw(width_float) << dragv.x << "\n";
+      drag_file.close();
+    }
+
+    // Write lift.txt
+    if (lift_file.is_open()) {
+      lift_file << std::setw(width_int) << tstep << " "
+                << std::setw(width_float) << std::setprecision(8)
+                << std::scientific << time << " " << std::setw(width_float)
+                << drag.y << " " << std::setw(width_float) << dragp.y << " "
+                << std::setw(width_float) << dragv.y << "\n";
+      lift_file.close();
+    }
+
+    // Write dragz.txt
+    if (dragz_file.is_open()) {
+      dragz_file << std::setw(width_int) << tstep << " "
+                 << std::setw(width_float) << std::setprecision(8)
+                 << std::scientific << time << " " << std::setw(width_float)
+                 << drag.z << " " << std::setw(width_float) << dragp.z << " "
+                 << std::setw(width_float) << dragv.z << "\n";
+      dragz_file.close();
+    }
+
+    // Write forces.txt
+    if (forces_file.is_open()) {
+      forces_file << std::setw(width_int) << tstep << " "
+                  << std::setw(width_float) << std::setprecision(8)
+                  << std::scientific << time << " " << std::setw(width_float)
+                  << F_drag << " " << std::setw(width_float) << F_lift << " "
+                  << std::setw(width_float) << Cd << " "
+                  << std::setw(width_float) << Cl << "\n";
+      forces_file.close();
+    }
+  }
+
+  MPC_of_LSM(nrs, time, tstep); //Comment out for const jet or baseline
+
+  // Condition to start averaging and dump stats along normals
+  if (time >= avg_time) {
+    tavg::run(time);
+    compute_dump_stats(nrs, time);
+  }
+
+  if (nrs->isOutputStep) {
+    const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+    // auto o_S0 = nrs->cds->o_S.slice(0 * fieldOffsetByte, fieldOffsetByte);
+    // postProcessing::Qcriterion(nrs, o_S0);
+    occa::memory o_Uavg = tavg::get_o_Uavg();
+
+    // copy vx mean to S1
+    nrs->cds->o_S.slice(1 * fieldOffsetByte, fieldOffsetByte).copyFrom(
+        o_Uavg.slice(0 * fieldOffsetByte, fieldOffsetByte));
+
+    // copy vy mean to S2
+    nrs->cds->o_S.slice(2 * fieldOffsetByte, fieldOffsetByte).copyFrom(
+        o_Uavg.slice(1 * fieldOffsetByte, fieldOffsetByte));
+  }
+}
