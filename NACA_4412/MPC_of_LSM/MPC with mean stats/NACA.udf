@@ -3,6 +3,7 @@
 //
 #include "plugins/tavg.hpp"
 #include "udf.hpp"
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -12,7 +13,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-
 
 #ifdef __okl__
 #include "NACA.oudf"
@@ -337,7 +337,8 @@ static inline std::size_t idx3(int i, int k, int j, int Np, int Nz)
 
 void writeNormalsRawVTK(const std::string &filename,
                         dfloat time,
-                        const std::vector<dfloat> &stations, int Np, int Nz,
+                        const std::vector<dfloat> &stations,
+                        int Np, int Nz,
                         const std::vector<dfloat> &x,
                         const std::vector<dfloat> &y,
                         const std::vector<dfloat> &z,
@@ -359,11 +360,14 @@ void writeNormalsRawVTK(const std::string &filename,
     return;
   }
 
-  const std::size_t Npts_expected = (std::size_t)Ns * (std::size_t)Np * (std::size_t)Nz;
+  const std::size_t Npts_expected =
+      (std::size_t)Ns * (std::size_t)Np * (std::size_t)Nz;
+
   auto check = [&](const char* name, const std::vector<dfloat>& a){
     if (a.size() != Npts_expected) {
-      std::cerr << "writeNormalsRawVTK: size mismatch for " << name
-                << " got " << a.size() << " expected " << Npts_expected << "\n";
+      std::cerr << "writeNormalsRawVTK: size mismatch for "
+                << name << " got " << a.size()
+                << " expected " << Npts_expected << "\n";
       return false;
     }
     return true;
@@ -386,6 +390,10 @@ void writeNormalsRawVTK(const std::string &filename,
   out << "ASCII\n";
   out << "DATASET POLYDATA\n";
 
+  out << "FIELD FieldData 1\n";
+  out << "TimeValue 1 1 float\n";
+  out << time << "\n";
+
   // ---- POINTS ----
   out << "POINTS " << Npts_expected << " float\n";
   for (int i = 0; i < Ns; ++i) {
@@ -403,16 +411,13 @@ void writeNormalsRawVTK(const std::string &filename,
   const std::size_t total_ints = (std::size_t)Nlines * ints_per_line;
 
   out << "LINES " << Nlines << " " << total_ints << "\n";
-
-  // Point ordering in file is: i-major, k-major, j-minor (inner loop j)
-  // That means the point id in VTK file is:
-  //   pid(i,k,j) = ((i*Np + k)*Nz + j)
-  // And for a fixed (i,j), k sweeps with stride Nz.
   for (int i = 0; i < Ns; ++i) {
     for (int j = 0; j < Nz; ++j) {
       out << Np;
       for (int k = 0; k < Np; ++k) {
-        const std::size_t pid = ((std::size_t)i*(std::size_t)Np + (std::size_t)k)*(std::size_t)Nz + (std::size_t)j;
+        const std::size_t pid =
+          ((std::size_t)i*(std::size_t)Np + (std::size_t)k)*(std::size_t)Nz
+          + (std::size_t)j;
         out << " " << pid;
       }
       out << "\n";
@@ -426,67 +431,80 @@ void writeNormalsRawVTK(const std::string &filename,
   auto xg = [&](int i, int k)->dfloat { return x[idx3(i,k,0,Np,Nz)]; };
   auto yg = [&](int i, int k)->dfloat { return y[idx3(i,k,0,Np,Nz)]; };
 
-  // We will compute per-point derived stats using station-local (t,n) from geometry at j=0
-  // and tau_w/utau computed from that plane (per station per z-plane would be more expensive;
-  // for raw output, you can keep per-plane tauw later if you want).
+  // Station-local tangents/normals (independent of span)
   std::vector<dfloat> nx_s(Ns), ny_s(Ns), tx_s(Ns), ty_s(Ns);
-  std::vector<dfloat> tauw_s(Ns,0.0), utau_s(Ns,0.0);
 
   for (int i = 0; i < Ns; ++i) {
     dfloat nx = xg(i,1) - xg(i,0);
     dfloat ny = yg(i,1) - yg(i,0);
     dfloat nrm = std::sqrt(nx*nx + ny*ny);
-    nx /= nrm; ny /= nrm;
+    nx /= nrm;
+    ny /= nrm;
 
     dfloat tx = -ny, ty = nx;
     if (tx < 0) { tx = -tx; ty = -ty; }
 
-    nx_s[i]=nx; ny_s[i]=ny; tx_s[i]=tx; ty_s[i]=ty;
+    nx_s[i] = nx; ny_s[i] = ny;
+    tx_s[i] = tx; ty_s[i] = ty;
+  }
 
-    auto ydist = [&](int k){
-      return (xg(i,k)-xg(i,0))*nx + (yg(i,k)-yg(i,0))*ny;
-    };
+  auto ydist = [&](int i, int k)->dfloat {
+    const dfloat nx = nx_s[i], ny = ny_s[i];
+    const dfloat x0 = xg(i,0), y0 = yg(i,0);
+    const dfloat xk = xg(i,k), yk = yg(i,k);
+    return (xk - x0)*nx + (yk - y0)*ny;
+  };
 
-    const dfloat y1 = ydist(1);
-    const dfloat y2 = ydist(2);
+  const dfloat y1 = ydist(0,1);
+  const dfloat y2 = ydist(0,2); // same for all j, geometry only
+  // coefficients for 2-point derivative in wall-normal direction
+  const dfloat b = y2 / (y1 * (y2 - y1));
+  const dfloat c = -y1 / (y2 * (y2 - y1));
 
-    // Use span-mean tauw for metadata (could also do per-plane)
-    // Here we compute tauw from span-averaged Ut at k=1,2
-    dfloat ut1 = 0, ut2 = 0;
-    for (int j=0;j<Nz;++j){
+  // *** CHANGED: local tauw and utau at each (i,j) ***
+  std::vector<dfloat> tauw_local(Npts_expected, 0.0);
+  std::vector<dfloat> utau_local(Npts_expected, 0.0);
+
+  for (int i = 0; i < Ns; ++i) {
+    const dfloat tx = tx_s[i], ty = ty_s[i];
+
+    for (int j = 0; j < Nz; ++j) {
+      // Local tangential velocity at k=1,2 for this span j
       const std::size_t id1 = idx3(i,1,j,Np,Nz);
       const std::size_t id2 = idx3(i,2,j,Np,Nz);
-      ut1 += (Umean[id1]*tx + Vmean[id1]*ty);
-      ut2 += (Umean[id2]*tx + Vmean[id2]*ty);
-    }
-    ut1 /= (dfloat)Nz;
-    ut2 /= (dfloat)Nz;
 
-    if (y1 > 0 && y2 > y1) {
-      const dfloat b = y2 / (y1 * (y2 - y1));
-      const dfloat c = -y1 / (y2 * (y2 - y1));
+      const dfloat ut1 = Umean[id1]*tx + Vmean[id1]*ty;
+      const dfloat ut2 = Umean[id2]*tx + Vmean[id2]*ty;
+
       const dfloat dutdn = b*ut1 + c*ut2;
       const dfloat tauw = mu * dutdn;
-      tauw_s[i] = tauw;
-      utau_s[i] = std::sqrt(std::abs(tauw)/rho);
+      const dfloat utau = std::sqrt(std::abs(tauw)/rho);
+
+      // Store the same tauw, utau for all k along this (i,j) line
+      for (int k = 0; k < Np; ++k) {
+        const std::size_t id = idx3(i,k,j,Np,Nz);
+        tauw_local[id] = tauw;
+        utau_local[id] = utau;
+      }
     }
   }
 
-  // ---- write raw mean vectors (global) ----
+  // Helper to write scalar arrays
   auto writeScalar = [&](const char* name, const std::vector<dfloat>& a){
     out << "SCALARS " << name << " float 1\n";
     out << "LOOKUP_TABLE default\n";
-    for (std::size_t p=0;p<Npts_expected;++p) out << (float)a[p] << "\n";
+    for (std::size_t p=0;p<Npts_expected;++p)
+      out << (float)a[p] << "\n";
   };
 
-  // station_xc (replicated)
+  // station_xc
   out << "SCALARS station_xc float 1\nLOOKUP_TABLE default\n";
   for (int i=0;i<Ns;++i)
     for (int k=0;k<Np;++k)
       for (int j=0;j<Nz;++j)
         out << (float)stations[i] << "\n";
 
-  // z-index and k-index for filtering
+  // indices for filtering
   out << "SCALARS z_index int 1\nLOOKUP_TABLE default\n";
   for (int i=0;i<Ns;++i)
     for (int k=0;k<Np;++k)
@@ -499,40 +517,34 @@ void writeNormalsRawVTK(const std::string &filename,
       for (int j=0;j<Nz;++j)
         out << k << "\n";
 
-  // tauw/utau replicated per station
-  out << "SCALARS tau_w float 1\nLOOKUP_TABLE default\n";
-  for (int i=0;i<Ns;++i)
-    for (int k=0;k<Np;++k)
-      for (int j=0;j<Nz;++j)
-        out << (float)tauw_s[i] << "\n";
-
-  out << "SCALARS u_tau float 1\nLOOKUP_TABLE default\n";
-  for (int i=0;i<Ns;++i)
-    for (int k=0;k<Np;++k)
-      for (int j=0;j<Nz;++j)
-        out << (float)utau_s[i] << "\n";
+  // *** CHANGED: write local tauw, utau (no replication from station) ***
+  writeScalar("tau_w", tauw_local);
+  writeScalar("u_tau", utau_local);
 
   // raw mean components
   writeScalar("Umean", Umean);
   writeScalar("Vmean", Vmean);
   writeScalar("Wmean", Wmean);
 
-  // ---- derived fields: ut, un, yplus, utplus, unplus, wplus, uuplus, vvplus, wwplus ----
+  // yplus using local utau(i,j)
   out << "SCALARS yplus float 1\nLOOKUP_TABLE default\n";
   for (int i=0;i<Ns;++i) {
-    const dfloat nx = nx_s[i], ny = ny_s[i], tx = tx_s[i], ty = ty_s[i];
-    auto ydist = [&](int k){
-      return (xg(i,k)-xg(i,0))*nx + (yg(i,k)-yg(i,0))*ny;
-    };
-    const dfloat utau = utau_s[i];
+    const dfloat nx = nx_s[i], ny = ny_s[i];
+    const dfloat x0 = xg(i,0), y0 = yg(i,0);
     for (int k=0;k<Np;++k) {
-      const dfloat yk = std::max<dfloat>(ydist(k), 0);
-      const dfloat ypl = (utau>0) ? (utau*yk/nu) : 0;
-      for (int j=0;j<Nz;++j) out << (float)ypl << "\n"; // same for all j at fixed k
+      // wall-normal distance for this (i,k)
+      const dfloat xk = xg(i,k), yk = yg(i,k);
+      const dfloat yk_n = std::max<dfloat>((xk-x0)*nx + (yk-y0)*ny, 0.0);
+      for (int j=0;j<Nz;++j) {
+        const std::size_t id = idx3(i,k,j,Np,Nz);
+        const dfloat utau = utau_local[id];
+        const dfloat ypl = (utau>0) ? (utau*yk_n/nu) : 0.0;
+        out << (float)ypl << "\n";
+      }
     }
   }
 
-  // ut and un
+  // ut
   out << "SCALARS ut float 1\nLOOKUP_TABLE default\n";
   for (int i=0;i<Ns;++i) {
     const dfloat tx = tx_s[i], ty = ty_s[i];
@@ -543,6 +555,7 @@ void writeNormalsRawVTK(const std::string &filename,
       }
   }
 
+  // un
   out << "SCALARS un float 1\nLOOKUP_TABLE default\n";
   for (int i=0;i<Ns;++i) {
     const dfloat nx = nx_s[i], ny = ny_s[i];
@@ -553,57 +566,61 @@ void writeNormalsRawVTK(const std::string &filename,
       }
   }
 
-  // wall-unit velocities
+  // utplus using local utau
   out << "SCALARS utplus float 1\nLOOKUP_TABLE default\n";
   for (int i=0;i<Ns;++i) {
     const dfloat tx = tx_s[i], ty = ty_s[i];
-    const dfloat utau = utau_s[i];
     for (int k=0;k<Np;++k)
       for (int j=0;j<Nz;++j) {
         const std::size_t id = idx3(i,k,j,Np,Nz);
         const dfloat ut = Umean[id]*tx + Vmean[id]*ty;
-        out << (float)((utau>0) ? (ut/utau) : 0) << "\n";
+        const dfloat utau = utau_local[id];
+        out << (float)((utau>0) ? (ut/utau) : 0.0) << "\n";
       }
   }
 
+  // unplus
   out << "SCALARS unplus float 1\nLOOKUP_TABLE default\n";
   for (int i=0;i<Ns;++i) {
     const dfloat nx = nx_s[i], ny = ny_s[i];
-    const dfloat utau = utau_s[i];
     for (int k=0;k<Np;++k)
       for (int j=0;j<Nz;++j) {
         const std::size_t id = idx3(i,k,j,Np,Nz);
         const dfloat un = Umean[id]*nx + Vmean[id]*ny;
-        out << (float)((utau>0) ? (un/utau) : 0) << "\n";
+        const dfloat utau = utau_local[id];
+        out << (float)((utau>0) ? (un/utau) : 0.0) << "\n";
       }
   }
 
+  // wplus
   out << "SCALARS wplus float 1\nLOOKUP_TABLE default\n";
   for (int i=0;i<Ns;++i) {
-    const dfloat utau = utau_s[i];
     for (int k=0;k<Np;++k)
       for (int j=0;j<Nz;++j) {
         const std::size_t id = idx3(i,k,j,Np,Nz);
-        out << (float)((utau>0) ? (Wmean[id]/utau) : 0) << "\n";
+        const dfloat utau = utau_local[id];
+        out << (float)((utau>0) ? (Wmean[id]/utau) : 0.0) << "\n";
       }
   }
 
-  // Reynolds normal stresses in local (t,n,w): uuplus= <ut'^2>/utau^2 etc (per point, no span avg)
+  // uuplus
   out << "SCALARS uuplus float 1\nLOOKUP_TABLE default\n";
   for (int i=0;i<Ns;++i) {
-    const dfloat nx = nx_s[i], ny = ny_s[i], tx = tx_s[i], ty = ty_s[i];
-    const dfloat utau = utau_s[i];
-    const dfloat utau2 = utau*utau;
+    const dfloat nx = nx_s[i], ny = ny_s[i];
+    const dfloat tx = tx_s[i], ty = ty_s[i];
     for (int k=0;k<Np;++k)
       for (int j=0;j<Nz;++j) {
         const std::size_t id = idx3(i,k,j,Np,Nz);
-        if (utau2 <= 0) { out << 0.0f << "\n"; continue; }
-
-        const dfloat Um = Umean[id], Vm = Vmean[id], Wm = Wmean[id];
+        const dfloat utau = utau_local[id];
+        const dfloat utau2 = utau*utau;
+        if (utau2 <= 0) {
+          out << 0.0f << "\n";
+          continue;
+        }
+        const dfloat Um = Umean[id], Vm = Vmean[id];
         dfloat uu = U2mean[id] - Um*Um;
         dfloat vv = V2mean[id] - Vm*Vm;
         dfloat uv = UVmean[id] - Um*Vm;
-
         uu = (uu > 0 ? uu : 0);
         vv = (vv > 0 ? vv : 0);
 
@@ -614,21 +631,24 @@ void writeNormalsRawVTK(const std::string &filename,
       }
   }
 
+  // vvplus
   out << "SCALARS vvplus float 1\nLOOKUP_TABLE default\n";
   for (int i=0;i<Ns;++i) {
-    const dfloat nx = nx_s[i], ny = ny_s[i], tx = tx_s[i], ty = ty_s[i];
-    const dfloat utau = utau_s[i];
-    const dfloat utau2 = utau*utau;
+    const dfloat nx = nx_s[i], ny = ny_s[i];
+    const dfloat tx = tx_s[i], ty = ty_s[i];
     for (int k=0;k<Np;++k)
       for (int j=0;j<Nz;++j) {
         const std::size_t id = idx3(i,k,j,Np,Nz);
-        if (utau2 <= 0) { out << 0.0f << "\n"; continue; }
-
-        const dfloat Um = Umean[id], Vm = Vmean[id], Wm = Wmean[id];
+        const dfloat utau = utau_local[id];
+        const dfloat utau2 = utau*utau;
+        if (utau2 <= 0) {
+          out << 0.0f << "\n";
+          continue;
+        }
+        const dfloat Um = Umean[id], Vm = Vmean[id];
         dfloat uu = U2mean[id] - Um*Um;
         dfloat vv = V2mean[id] - Vm*Vm;
         dfloat uv = UVmean[id] - Um*Vm;
-
         uu = (uu > 0 ? uu : 0);
         vv = (vv > 0 ? vv : 0);
 
@@ -639,19 +659,21 @@ void writeNormalsRawVTK(const std::string &filename,
       }
   }
 
+  // wwplus
   out << "SCALARS wwplus float 1\nLOOKUP_TABLE default\n";
   for (int i=0;i<Ns;++i) {
-    const dfloat utau = utau_s[i];
-    const dfloat utau2 = utau*utau;
     for (int k=0;k<Np;++k)
       for (int j=0;j<Nz;++j) {
         const std::size_t id = idx3(i,k,j,Np,Nz);
-        if (utau2 <= 0) { out << 0.0f << "\n"; continue; }
-
+        const dfloat utau = utau_local[id];
+        const dfloat utau2 = utau*utau;
+        if (utau2 <= 0) {
+          out << 0.0f << "\n";
+          continue;
+        }
         const dfloat Wm = Wmean[id];
         dfloat ww = W2mean[id] - Wm*Wm;
         ww = (ww > 0 ? ww : 0);
-
         out << (float)(ww/utau2) << "\n";
       }
   }
