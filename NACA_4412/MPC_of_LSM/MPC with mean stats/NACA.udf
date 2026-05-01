@@ -380,13 +380,12 @@ void writeNormalsRawVTK(const std::string &filename,
     return;
   }
 
-  // Overwrite file each call
   std::ofstream out(filename, std::ios::out | std::ios::trunc);
   out << std::scientific << std::setprecision(8);
 
-  // ---- VTK legacy PolyData header ----
+  // ---- VTK header ----
   out << "# vtk DataFile Version 3.0\n";
-  out << "NEKRS normal probes raw (no span avg)\n";
+  out << "NEKRS normal probes raw (local spanwise tauw/utau)\n";
   out << "ASCII\n";
   out << "DATASET POLYDATA\n";
 
@@ -405,9 +404,9 @@ void writeNormalsRawVTK(const std::string &filename,
     }
   }
 
-  // ---- LINES: Ns*Nz polylines, each of length Np ----
+  // ---- LINES ----
   const int Nlines = Ns * Nz;
-  const std::size_t ints_per_line = 1 + (std::size_t)Np;         // "Np idx0 idx1 ... "
+  const std::size_t ints_per_line = 1 + (std::size_t)Np;
   const std::size_t total_ints = (std::size_t)Nlines * ints_per_line;
 
   out << "LINES " << Nlines << " " << total_ints << "\n";
@@ -424,10 +423,9 @@ void writeNormalsRawVTK(const std::string &filename,
     }
   }
 
-  // ---- POINT DATA ----
   out << "POINT_DATA " << Npts_expected << "\n";
 
-  // Helper lambdas for geometry (use j=0 plane for normals/tangents per station)
+  // Geometry helper (j=0 plane)
   auto xg = [&](int i, int k)->dfloat { return x[idx3(i,k,0,Np,Nz)]; };
   auto yg = [&](int i, int k)->dfloat { return y[idx3(i,k,0,Np,Nz)]; };
 
@@ -1295,7 +1293,12 @@ void UDF_Setup(nrs_t *nrs) {
   // Interpolation setup
   setupInterpolators(nrs, obsInterpolator, o_ObsUbar, o_ObsVbar, o_ObsUprime,
                      obs_np, ctrlInterpolator, o_CtrlVprime, ctrl_np);
-  
+                     
+  // Filling SO with zeros after reading restart
+  const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
+  auto o_S0 = nrs->cds->o_S.slice(0 * fieldOffsetByte);
+  platform->linAlg->fill(nrs->meshV->Nlocal,0.0,o_S0);
+
   // Setting jet_input = 0 for baseline
   // jet_input = 0.0;
 }
@@ -1402,13 +1405,17 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep) {
     // auto o_S0 = nrs->cds->o_S.slice(0 * fieldOffsetByte, fieldOffsetByte);
     // postProcessing::Qcriterion(nrs, o_S0);
     occa::memory o_Uavg = tavg::get_o_Uavg();
+    occa::memory o_Pavg = tavg::get_o_Pavg();
 
-    // copy vx mean to S1
-    nrs->cds->o_S.slice(1 * fieldOffsetByte, fieldOffsetByte).copyFrom(
-        o_Uavg.slice(0 * fieldOffsetByte, fieldOffsetByte));
+    auto o_S1 = nrs->cds->o_S.slice(1 * fieldOffsetByte, fieldOffsetByte);
+    occa::memory o_mean_vx = o_Uavg.slice(0 * fieldOffsetByte, fieldOffsetByte);
+    o_mean_vx.copyTo(o_S1);
 
-    // copy vy mean to S2
-    nrs->cds->o_S.slice(2 * fieldOffsetByte, fieldOffsetByte).copyFrom(
-        o_Uavg.slice(1 * fieldOffsetByte, fieldOffsetByte));
+    auto o_S2 = nrs->cds->o_S.slice(2 * fieldOffsetByte, fieldOffsetByte);
+    occa::memory o_mean_vy = o_Uavg.slice(1 * fieldOffsetByte, fieldOffsetByte);
+    o_mean_vy.copyTo(o_S2);
+
+    auto o_S4 = nrs->cds->o_S.slice(4 * fieldOffsetByte, fieldOffsetByte);
+    o_Pavg.copyTo(o_S4);
   }
 }
