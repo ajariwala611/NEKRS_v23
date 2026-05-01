@@ -9,7 +9,7 @@ deviceNumber = LOCAL-RANK
 #verbose = true
 # startFrom = "restart_file+time=0.0"
 polynomialOrder = 7
-subCyclingSteps = 4
+subCyclingSteps = 1
 stopAt =  endTime #numSteps#endTime
 endTime = 15.0
 
@@ -35,16 +35,19 @@ viscosity = 1/400000
 density = 1.0
 residualTol = 1e-06
 
-[SCALAR00] # Jet field
+[SCALAR00] # Jet force field
 solver = none
 
 [SCALAR01] # <U>
 solver = none
 
-[SCALAR02] # <V> 
+[SCALAR02] # <V>
 solver = none
 
-[SCALAR03] # Tripping Field 
+[SCALAR03] # Tripping Forces
+solver = none
+
+[SCALAR04] # <P>
 solver = none
 
 [CASEDATA]
@@ -75,6 +78,6 @@ jet_scale = 2.5     # Scaling parameter for forces
 jet_pitch = -45     # pitch angle for forces in degree
 jet_rota = 11       # roation angle for jet field in degree
 mpc_time_delay = 0.0    # time delay to start MPC
-mpc_rom_time = 1e-3     # ROM time step: ROM is trained on every 10 LES time,dt_LES=1e-4 (const u during this time)
-mpc_time_horizon = 50   # Time horizon for control problem in ROM time steps
-mpc_meas_freq = 0.05    # Time between consecutive new measurements resolve MPC-QP
+mpc_rom_time = 1e-3     # ROM time step: ROM is trained on every 10 LES time and each was dt=1e-4
+mpc_time_horizon = 100   # Time horizon for control problem in ROM time steps
+mpc_meas_freq = 0.025    # Time between consecutive new measurements
