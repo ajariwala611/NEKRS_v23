@@ -1086,76 +1086,6 @@ void interpolateObsGrid(nrs_t *nrs, dfloat time, int tstep,
   }
 }
 
-
-void interpolateObsCtrlGrid(nrs_t *nrs, dfloat time, int tstep,
-                            occa::memory o_mean_vx) {
-
-  // Interpolate velocity
-  const auto fieldOffsetByte = nrs->fieldOffset * sizeof(dfloat);
-  // occa::memory o_mean_vx = o_Uavg.slice(1 * fieldOffsetByte,
-  // fieldOffsetByte);
-
-  // Interpolate vertical velocity fluctuation
-  occa::memory vx_prime =
-      platform->device.malloc(nrs->fieldOffset, sizeof(dfloat));
-  occa::memory o_vx = nrs->o_U.slice(0 * fieldOffsetByte, fieldOffsetByte);
-  platform->linAlg->axpbyz(nrs->meshV->Nlocal, 1.0, o_vx, -1.0, o_mean_vx,
-                           vx_prime);
-  ctrlInterpolator->eval(1, nrs->fieldOffset, vx_prime, ctrl_np, o_CtrlUprime);
-
-  if (platform->comm.mpiRank == 0) {
-    std::vector<dfloat> CtrlUp(ctrl_np);
-    o_CtrlUprime.copyTo(CtrlUp.data());
-
-    // Open file in append mode
-    std::ofstream fout("control_grid_LSM_data.txt", std::ios::app);
-
-    const int first_col_width = 6; // For time, tstep, control_input
-    const int ctrlUp_width = 15;   // For CtrlUp values (scientific notation)
-
-    // First three columns: width 6, default notation
-    fout << std::setw(first_col_width) << std::setprecision(4) << time << " ";
-    fout << std::setw(first_col_width) << tstep << " ";
-
-    // Remaining columns: width 15, scientific notation
-    for (int i = 0; i < ctrl_np; ++i) {
-      fout << std::setw(ctrlUp_width) << std::setprecision(8) << std::scientific
-           << CtrlUp[i] << " ";
-    }
-    fout << std::endl;
-    fout.close();
-
-    printf("Appended LSM data into control_grid_LSM_data.txt... Done\n");
-  }
-
-  obsInterpolator->eval(1, nrs->fieldOffset, vx_prime, obs_np, o_ObsUprime);
-
-  if (platform->comm.mpiRank == 0) {
-    std::vector<dfloat> ObsUp(obs_np);
-    o_ObsUprime.copyTo(ObsUp.data());
-
-    // Open file in append mode
-    std::ofstream fout("observation_grid_LSM_data.txt", std::ios::app);
-
-    const int first_col_width = 6; // For time, tstep, control_input
-    const int obsUp_width = 15;    // For CtrlUp values (scientific notation)
-
-    // First three columns: width 6, default notation
-    fout << std::setw(first_col_width) << std::setprecision(4) << time << " ";
-    fout << std::setw(first_col_width) << tstep << " ";
-
-    // Remaining columns: width 15, scientific notation
-    for (int i = 0; i < obs_np; ++i) {
-      fout << std::setw(obsUp_width) << std::setprecision(8) << std::scientific
-           << ObsUp[i] << " ";
-    }
-    fout << std::endl;
-    fout.close();
-
-    printf("Appended LSM data into observation_grid_LSM_data.txt... Done\n");
-  }
-}
-
 void interpolateCtrlGrid(nrs_t *nrs, dfloat time, int tstep,
                          dfloat last_u_optimal, occa::memory o_mean_vy) {
 
@@ -1335,7 +1265,7 @@ void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep) {
     update_mean_views_from_tavg(nrs, o_mean_vx, o_mean_vy);
     mpc_time_delay += time; // first allowed MPC update
     last_mpc_update_time = mpc_time_delay;
-	  jet_input = 0.0;
+	jet_input = 0.0;
     u_optimal.assign(mpc_time_horizon, 0.0);
     // Calling this at the beginning to write mean velo.
     interpolateObsGrid_mean(nrs, time, tstep, o_mean_vx, o_mean_vy);
@@ -1384,11 +1314,6 @@ void MPC_of_LSM(nrs_t *nrs, dfloat time, int tstep) {
     fout.close();
   }
 
-  // Calling this every 40 becasue ROM = 40 * dt = 1e-3
-  if (tstep % 40 == 0) {
-    update_mean_views_from_tavg(nrs, o_mean_vx, o_mean_vy);
-    interpolateObsCtrlGrid(nrs, time, tstep, o_mean_vx);
-  }
 }
 
 /* UDF Functions */
