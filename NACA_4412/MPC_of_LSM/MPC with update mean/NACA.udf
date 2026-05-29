@@ -60,7 +60,7 @@ static dfloat jet_input;
 
 static dfloat mpc_time_delay;
 static dfloat mpc_rom_time;
-static dfloat mpc_time_horizon;
+static int mpc_time_horizon;
 static dfloat mpc_meas_freq;
 static std::vector<dfloat> u_optimal;
 
@@ -355,7 +355,7 @@ void writeNormalsRawVTK(const std::string &filename,
 {
   const int Ns = (int)stations.size();
 
-  if (Np < 3 || Nz <= 0 || Ns <= 0) {
+  if (Np < 3 || Nz < 2 || Ns <= 0) {
     std::cerr << "writeNormalsRawVTK: bad sizes (Ns,Np,Nz)=("
               << Ns << "," << Np << "," << Nz << ")\n";
     return;
@@ -405,22 +405,24 @@ void writeNormalsRawVTK(const std::string &filename,
     }
   }
 
-  // ---- LINES ----
-  const int Nlines = Ns * Nz;
-  const std::size_t ints_per_line = 1 + (std::size_t)Np;
-  const std::size_t total_ints = (std::size_t)Nlines * ints_per_line;
+  // ---- SURFACES ----
+  // Each chord station is written as its own wall-normal/spanwise quad sheet.
+  // We do not connect neighboring chord stations, so ParaView can inspect each
+  // x/c station as a separate surface.
+  const int Nquads = Ns * (Np - 1) * (Nz - 1);
+  const std::size_t ints_per_quad = 1 + 4;
+  const std::size_t total_ints = (std::size_t)Nquads * ints_per_quad;
 
-  out << "LINES " << Nlines << " " << total_ints << "\n";
+  out << "POLYGONS " << Nquads << " " << total_ints << "\n";
   for (int i = 0; i < Ns; ++i) {
-    for (int j = 0; j < Nz; ++j) {
-      out << Np;
-      for (int k = 0; k < Np; ++k) {
-        const std::size_t pid =
-          ((std::size_t)i*(std::size_t)Np + (std::size_t)k)*(std::size_t)Nz
-          + (std::size_t)j;
-        out << " " << pid;
+    for (int k = 0; k < Np - 1; ++k) {
+      for (int j = 0; j < Nz - 1; ++j) {
+        const std::size_t p00 = idx3(i, k,     j,     Np, Nz);
+        const std::size_t p10 = idx3(i, k + 1, j,     Np, Nz);
+        const std::size_t p11 = idx3(i, k + 1, j + 1, Np, Nz);
+        const std::size_t p01 = idx3(i, k,     j + 1, Np, Nz);
+        out << "4 " << p00 << " " << p10 << " " << p11 << " " << p01 << "\n";
       }
-      out << "\n";
     }
   }
 
@@ -504,6 +506,12 @@ void writeNormalsRawVTK(const std::string &filename,
         out << (float)stations[i] << "\n";
 
   // indices for filtering
+  out << "SCALARS station_index int 1\nLOOKUP_TABLE default\n";
+  for (int i=0;i<Ns;++i)
+    for (int k=0;k<Np;++k)
+      for (int j=0;j<Nz;++j)
+        out << i << "\n";
+
   out << "SCALARS z_index int 1\nLOOKUP_TABLE default\n";
   for (int i=0;i<Ns;++i)
     for (int k=0;k<Np;++k)
