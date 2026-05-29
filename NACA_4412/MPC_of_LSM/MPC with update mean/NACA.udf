@@ -1227,7 +1227,7 @@ void init_tavg_from_restart(nrs_t* nrs)
 {
 
   if (platform->comm.mpiRank == 0) {
-    printf("Reading S1 and S2 from restart to Tavg fields");
+    printf("Reading S1 and S2 from restart to Tavg fields \n");
   }
   const dlong fieldOffset     = nrs->fieldOffset;
   const auto  fieldOffsetByte = fieldOffset * sizeof(dfloat);
