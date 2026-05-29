@@ -1,0 +1,21 @@
+#!/bin/bash
+#SBATCH -J fMPCIJR4
+#SBATCH -o logfile 
+#SBATCH -e errfile
+#SBATCH -p gh
+#SBATCH -N 8
+#SBATCH -n 8
+#SBATCH --ntasks-per-node 1
+#SBATCH -t 24:00:00
+
+module purge
+module reset
+module load gcc/15.1
+module load cuda/13.1
+module load cmake/3.31.5
+module load openmpi/5.0.9
+module load python3
+module list
+
+#rm -rf .cache
+./config.sh
