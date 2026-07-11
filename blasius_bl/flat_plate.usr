@@ -38,15 +38,7 @@
       end
 !-----------------------------------------------------------------------
       subroutine userf(ix,iy,iz,eg) ! set acceleration term
-!
-!         Note: this is an acceleration term, NOT a force!
-!         Thus, ffx will subsequently be multiplied by rho(x,t).
-!
-!         Note: This function will be used to implemend immersed boundary forces.
-!         Assumes constant rho = 1
-!
-!         Modified by Alex Tsolovikos on 2022-01-12
-!
+
           implicit none
 
           integer ix,iy,iz,eg
@@ -86,19 +78,7 @@
       end
 !-----------------------------------------------------------------------
       subroutine userbc(ix,iy,iz,iside,eg) ! set up boundary conditions
-!
-!         NOTE ::: This subroutine MAY NOT be called by every process
-!
-!         The boundary conditions are:
-!             1) Blasius boundary layer at the inlet
-!             2) Convective BC at the outlet
-!             3) No-slip BC at the wall (y=0)
-!             4) v = V_Blasius, du/dy = dv/dx, dw/dy = dv/dz
-!                (zero vorticity) at the top (y=1)
-!             5) Periodic BC at the sides (z=0, z=1)
-!         NOTE ::: Only BCs 1) and 4) are implemented here. The others are 
-!                  implemented by the mesh.
-!         
+       
           implicit none
 
           integer ix,iy,iz,iside,eg,e
@@ -128,10 +108,7 @@
       end
 !-----------------------------------------------------------------------
       subroutine useric(ix,iy,iz,eg) ! set up initial conditions
-!
-!         Set the Blasius solution everywhere.
-!         Modified by Alex Tsolovikos on 2022-01-11
-!
+      
           implicit none
 
           integer ix,iy,iz,eg,e
@@ -184,7 +161,9 @@
        ymax = glmax(yc,n)
 
        do i = 1,n
-           yc(i,1) = ymin + (ymax - ymin) * (tanh( BETAM * (yc(i,1)/(ymax-ymin)-1)) / tanh(BETAM) + 1)
+           yc(i,1) = ymin + (ymax - ymin)
+     &         * (tanh( BETAM * (yc(i,1)/(ymax-ymin)-1))
+     &         / tanh(BETAM) + 1)
        end do
 
       return
@@ -281,7 +260,8 @@
               call pwl_value_1d(10001,eta,fp,1,eta_tmp,fp_tmp)
 
               ub(i,1,1,1) = U_inf * fp_tmp
-              vb(i,1,1,1) = U_inf * (eta_tmp * fp_tmp - f_tmp)/(2.0 * sqrt(Rex))
+              vb(i,1,1,1) = U_inf
+     &            * (eta_tmp * fp_tmp - f_tmp)/(2.0 * sqrt(Rex))
           end do
 
           return

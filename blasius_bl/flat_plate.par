@@ -17,8 +17,6 @@ timeStepper = tombo2
 writeControl = simulationTime 
 writeInterval = 1
 
-regularization = hpfrt + nModes=1 + scalingCoeff=5
-
 [PRESSURE]
 residualTol = 1e-06
 
